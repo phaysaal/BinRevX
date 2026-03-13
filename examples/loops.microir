@@ -1,0 +1,29 @@
+# Simple MicroIR example for BinRevX
+
+func sum_to_ten entry entry
+block entry
+assign i const 0
+assign sum const 0
+term jump hdr
+block hdr
+term branch lt i 10 body exit
+block body
+assign sum binop add sum i
+assign i binop add i 1
+term jump hdr
+block exit
+term ret sum
+endfunc
+
+func branch_only entry entry
+block entry
+term branch eq x 0 then0 else0
+block then0
+assign r const 1
+term jump join
+block else0
+assign r const 2
+term jump join
+block join
+term ret r
+endfunc

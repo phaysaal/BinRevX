@@ -1,0 +1,10 @@
+build/
+_build/
+*.cmi
+*.cmo
+*.cmx
+*.o
+*.native
+*.byte
+binrevx
+.merlin
