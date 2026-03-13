@@ -12,6 +12,11 @@ type evidence = {
   null_guard : bool;
   arithmetic_stride : bool;
   pointer_chase : bool;
+  cursor : string option;
+  index_base : string option;
+  element_width : int option;
+  field_name : string option;
+  guard_var : string option;
 }
 
 type t = {
@@ -19,6 +24,7 @@ type t = {
   scores : (string * int) list;
   evidence : evidence;
   reasons : string list;
+  derived_facts : string list;
 }
 
 let empty_evidence =
@@ -30,6 +36,11 @@ let empty_evidence =
     null_guard = false;
     arithmetic_stride = false;
     pointer_chase = false;
+    cursor = None;
+    index_base = None;
+    element_width = None;
+    field_name = None;
+    guard_var = None;
   }
 
 let kind_name = function
@@ -50,6 +61,10 @@ let is_pointer_chase_transition (tr : LoopSummary.transition) =
   && (tr.after = prefix1 || String.sub tr.after 0 (String.length prefix2) = prefix2)
 
 let uniq xs = List.sort_uniq String.compare xs
+
+let pp_opt f = function
+  | Some x -> f x
+  | None -> "?"
 
 let has_phrase s phrase =
   let n = String.length s and m = String.length phrase in
@@ -99,6 +114,20 @@ let guard_tests_zero defs = function
       | None -> false, false, None)
   | _ -> false, false, None
 
+let first_index_shape instrs =
+  instrs
+  |> List.find_map (function
+       | MicroIR.IAssign (_, MicroIR.EIndex (base, idx, width)) ->
+           Some (value_name base, value_name idx, Some width)
+       | _ -> None)
+
+let first_field_shape instrs =
+  instrs
+  |> List.find_map (function
+       | MicroIR.IAssign (_, MicroIR.EField (base, fld)) ->
+           Some (value_name base, Some fld)
+       | _ -> None)
+
 let analyze_loop fn (lp : LoopRecovery.loop_desc) (ls : LoopSummary.t) =
   let bmap = CfgAnalysis.block_map fn in
   let instrs =
@@ -107,6 +136,16 @@ let analyze_loop fn (lp : LoopRecovery.loop_desc) (ls : LoopSummary.t) =
     |> List.concat_map (fun blk -> blk.MicroIR.body)
   in
   let defs = defs_of_instrs instrs in
+  let index_base, index_cursor, element_width =
+    match first_index_shape instrs with
+    | Some (base, idx, width) -> (base, idx, width)
+    | None -> (None, None, None)
+  in
+  let field_base, field_name =
+    match first_field_shape instrs with
+    | Some (base, fld) -> (base, fld)
+    | None -> (None, None)
+  in
   let index_cursor_vars =
     instrs
     |> List.filter_map (function
@@ -174,6 +213,20 @@ let analyze_loop fn (lp : LoopRecovery.loop_desc) (ls : LoopSummary.t) =
       null_guard;
       arithmetic_stride;
       pointer_chase;
+      cursor =
+        (match guard_var with
+        | Some v -> Some v
+        | None ->
+            (match index_cursor with
+            | Some v when List.mem v lp.carried -> Some v
+            | _ ->
+                (match field_base with
+                | Some v when List.mem v lp.carried -> Some v
+                | _ -> None)));
+      index_base;
+      element_width;
+      field_name;
+      guard_var;
     }
   in
   let array_score =
@@ -213,6 +266,24 @@ let analyze_loop fn (lp : LoopRecovery.loop_desc) (ls : LoopSummary.t) =
       | "linked-list" -> LinkedListLoop
       | _ -> UnknownLoop
   in
+  let chosen_cursor =
+    match kind with
+    | ArrayLoop | StringLoop -> (
+        match index_cursor with
+        | Some v -> Some v
+        | _ -> None)
+    | LinkedListLoop -> (
+        match guard_var with
+        | Some v -> Some v
+        | None ->
+            (match field_base with
+            | Some v when List.mem v lp.carried -> Some v
+            | _ -> None))
+    | UnknownLoop -> None
+  in
+  let evidence =
+    { evidence with cursor = chosen_cursor }
+  in
   let reasons =
     [
       (stable_index_access, "indexed access through carried cursor");
@@ -225,7 +296,49 @@ let analyze_loop fn (lp : LoopRecovery.loop_desc) (ls : LoopSummary.t) =
     ]
     |> List.filter_map (fun (b, s) -> if b then Some s else None)
   in
-  { kind; scores; evidence; reasons }
+  let derived_facts =
+    (match kind with
+    | ArrayLoop ->
+        [
+          (match evidence.cursor with
+          | Some c -> Some (Printf.sprintf "%s is the array traversal cursor" c)
+          | None -> None);
+          (match evidence.index_base with
+          | Some b -> Some (Printf.sprintf "%s is the stable array base" b)
+          | None -> None);
+          (match evidence.element_width with
+          | Some w -> Some (Printf.sprintf "array element width = %d" w)
+          | None -> None);
+          (match ls.guard with
+          | g when g <> "loop_guard_unknown" ->
+              Some (Printf.sprintf "loop bound is guarded by %s" g)
+          | _ -> None);
+        ]
+    | StringLoop ->
+        [
+          (match evidence.cursor with
+          | Some c -> Some (Printf.sprintf "%s is the string cursor" c)
+          | None -> None);
+          (match evidence.index_base with
+          | Some b -> Some (Printf.sprintf "%s is the string base" b)
+          | None -> None);
+          Some "termination is driven by a zero byte sentinel";
+          Some "string traversal reads one byte per iteration";
+        ]
+    | LinkedListLoop ->
+        [
+          (match evidence.cursor with
+          | Some c -> Some (Printf.sprintf "%s is the list cursor" c)
+          | None -> None);
+          (match evidence.field_name with
+          | Some fld -> Some (Printf.sprintf "pointer chasing follows field %s" fld)
+          | None -> None);
+          Some "termination is driven by a null pointer test";
+        ]
+    | UnknownLoop -> [])
+    |> List.filter_map (fun x -> x)
+  in
+  { kind; scores; evidence; reasons; derived_facts }
 
 let render p =
   let scores =
@@ -233,8 +346,20 @@ let render p =
     |> List.map (fun (k, v) -> k ^ "=" ^ string_of_int v)
     |> String.concat ","
   in
+  let ev = p.evidence in
+  let evidence_s =
+    Printf.sprintf
+      "cursor=%s,base=%s,width=%s,field=%s,guard=%s"
+      (pp_opt (fun x -> x) ev.cursor)
+      (pp_opt (fun x -> x) ev.index_base)
+      (pp_opt string_of_int ev.element_width)
+      (pp_opt (fun x -> x) ev.field_name)
+      (pp_opt (fun x -> x) ev.guard_var)
+  in
   Printf.sprintf
-    "memory-pattern(kind=%s, scores=[%s], reasons=[%s])"
+    "memory-pattern(kind=%s, scores=[%s], evidence={%s}, reasons=[%s], facts=[%s])"
     (kind_name p.kind)
     scores
+    evidence_s
     (String.concat "; " p.reasons)
+    (String.concat "; " p.derived_facts)
