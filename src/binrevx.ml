@@ -96,7 +96,8 @@ let print_loop_invariants fn =
         match CfgAnalysis.SM.find_opt lp.LoopRecovery.header header_states with
         | Some st ->
             let summary = LoopSummary.summarize fn st lp in
-            let inv = InvariantGen.generate summary in
+            let pat = MemoryPattern.analyze_loop fn lp summary in
+            let inv = InvariantGen.generate ~pattern:pat summary in
             print_endline ("    " ^ InvariantGen.render inv)
         | None ->
             print_endline
@@ -134,8 +135,9 @@ let print_loop_vcs fn =
         match CfgAnalysis.SM.find_opt lp.LoopRecovery.header header_states with
         | Some st ->
             let summary = LoopSummary.summarize fn st lp in
-            let inv = InvariantGen.generate summary in
-            let vcs = VcGen.loop_vcs summary inv in
+            let pat = MemoryPattern.analyze_loop fn lp summary in
+            let inv = InvariantGen.generate ~pattern:pat summary in
+            let vcs = VcGen.loop_vcs ~pattern:pat summary inv in
             print_endline ("    " ^ VcGen.render vcs)
         | None ->
             print_endline

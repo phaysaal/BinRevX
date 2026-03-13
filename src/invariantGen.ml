@@ -74,11 +74,51 @@ let imply_nonneg (ls : LoopSummary.t) =
       [ lhs ^ " is bounded below by " ^ rhs ]
   | _ -> []
 
-let generate (ls : LoopSummary.t) =
+let memory_pattern_facts (pat : MemoryPattern.t option) =
+  match pat with
+  | None -> []
+  | Some pat -> (
+      let ev = pat.MemoryPattern.evidence in
+      match pat.MemoryPattern.kind with
+      | MemoryPattern.ArrayLoop ->
+          [
+            (match ev.cursor with
+            | Some c -> Some (c ^ " indexes the same array base across iterations")
+            | None -> None);
+            (match ev.index_base with
+            | Some b -> Some (b ^ " remains the stable array base")
+            | None -> None);
+            (match ev.element_width with
+            | Some w -> Some ("element_width = " ^ string_of_int w)
+            | None -> None);
+          ]
+      | MemoryPattern.StringLoop ->
+          [
+            (match ev.cursor with
+            | Some c -> Some (c ^ " advances one byte per iteration")
+            | None -> None);
+            Some "loaded byte is compared against zero";
+            Some "string cursor stays within the same string base";
+          ]
+      | MemoryPattern.LinkedListLoop ->
+          [
+            (match ev.cursor with
+            | Some c -> Some (c ^ " follows the next-chain")
+            | None -> None);
+            (match ev.field_name with
+            | Some fld -> Some ("list traversal field = " ^ fld)
+            | None -> None);
+            Some "cursor is null-tested at loop header";
+          ]
+      | MemoryPattern.UnknownLoop -> [])
+      |> List.filter_map (fun x -> x)
+
+let generate ?pattern (ls : LoopSummary.t) =
   let facts =
     facts_from_guard ls
     @ List.concat_map facts_from_transition ls.transitions
     @ imply_nonneg ls
+    @ memory_pattern_facts pattern
     |> sort_uniq
   in
   { header = ls.header; facts }

@@ -64,12 +64,72 @@ let prime_expr s =
   Buffer.contents buf
 
 let formal_facts inv =
+  let has_relation s =
+    has_phrase s " < "
+    || has_phrase s " <= "
+    || has_phrase s " > "
+    || has_phrase s " >= "
+    || has_phrase s " != "
+    || has_phrase s " = "
+  in
   inv.InvariantGen.facts
   |> List.filter (fun s ->
-         not (has_phrase s " is ")
+         has_relation s
+         && not (has_phrase s " is ")
+         && not (has_phrase s "same ")
+         && not (has_phrase s "stable ")
+         && not (has_phrase s "within ")
+         && not (has_phrase s "next-chain")
+         && not (has_phrase s "null-tested")
+         && not (has_phrase s " advances ")
+         && not (has_phrase s "advances one byte")
+         && not (has_phrase s "loaded byte")
+         && not (has_phrase s "list traversal field")
          && not (looks_heuristic s))
 
-let loop_vcs (ls : LoopSummary.t) (inv : InvariantGen.t) =
+let memory_obligations (ls : LoopSummary.t) (pat : MemoryPattern.t option) =
+  match pat with
+  | None -> []
+  | Some pat -> (
+      let ev = pat.MemoryPattern.evidence in
+      match pat.MemoryPattern.kind with
+      | MemoryPattern.ArrayLoop ->
+          [
+            (match ev.cursor, ev.index_base with
+            | Some c, Some b ->
+                Some
+                  (mk
+                     "array-base-stability"
+                     (conjunction [ ls.guard; c ^ "' = " ^ c ^ " + 1" ]
+                    ^ " => same_base(" ^ b ^ "," ^ b ^ "')"))
+            | _ -> None);
+          ]
+      | MemoryPattern.StringLoop ->
+          [
+            (match ev.cursor, ev.index_base with
+            | Some c, Some b ->
+                Some
+                  (mk
+                     "string-sentinel-safety"
+                     (conjunction [ ls.guard; c ^ "' = " ^ c ^ " + 1" ]
+                    ^ " => byte(" ^ b ^ "," ^ c ^ ") != 0"))
+            | _ -> None);
+          ]
+      | MemoryPattern.LinkedListLoop ->
+          [
+            (match ev.cursor, ev.field_name with
+            | Some c, Some fld ->
+                Some
+                  (mk
+                     "list-next-safety"
+                     (conjunction [ ls.guard; c ^ " != 0" ]
+                    ^ " => readable_field(" ^ c ^ "," ^ fld ^ ")"))
+            | _ -> None);
+          ]
+      | MemoryPattern.UnknownLoop -> [])
+      |> List.filter_map (fun x -> x)
+
+let loop_vcs ?pattern (ls : LoopSummary.t) (inv : InvariantGen.t) =
   let inv_facts = formal_facts inv in
   let inv_c = conjunction inv_facts in
   let tr_c =
@@ -89,6 +149,7 @@ let loop_vcs (ls : LoopSummary.t) (inv : InvariantGen.t) =
         "exit"
         (conjunction [ inv_c; "!(" ^ ls.guard ^ ")" ] ^ " => exit_state(" ^ ls.header ^ ")");
     ]
+    @ memory_obligations ls pattern
   in
   { scope = ls.header; obligations }
 
