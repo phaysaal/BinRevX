@@ -18,6 +18,8 @@ let used_expr = function
   | MicroIR.EBinop (_, a, b) -> used_value a @ used_value b
   | MicroIR.ELoad v -> used_value v
   | MicroIR.EAddr (v, _) -> used_value v
+  | MicroIR.EIndex (base, idx, _) -> used_value base @ used_value idx
+  | MicroIR.EField (base, _) -> used_value base
   | MicroIR.ECmp (_, a, b) -> used_value a @ used_value b
 
 let defs_of_instr = function
@@ -59,6 +61,29 @@ let empty fname =
     calls = [];
   }
 
+let defs_of_block blk =
+  List.fold_left
+    (fun acc ins -> defs_of_instr ins @ acc)
+    []
+    blk.MicroIR.body
+  |> sort_uniq
+
+let local_uses_before_defs blk =
+  let seen_defs = ref CfgAnalysis.SS.empty in
+  let uses = ref [] in
+  let record_use v =
+    if not (CfgAnalysis.SS.mem v !seen_defs) then uses := v :: !uses
+  in
+  List.iter
+    (fun ins ->
+      List.iter record_use (uses_of_instr ins);
+      List.iter
+        (fun v -> seen_defs := CfgAnalysis.SS.add v !seen_defs)
+        (defs_of_instr ins))
+    blk.MicroIR.body;
+  List.iter record_use (uses_of_term blk.MicroIR.term);
+  sort_uniq !uses
+
 let infer (fn : MicroIR.func) =
   let defs = ref [] in
   let uses = ref [] in
@@ -83,11 +108,87 @@ let infer (fn : MicroIR.func) =
       | Some r -> returns := r :: !returns
       | None -> ())
     fn.MicroIR.blocks;
-  let defset =
+  let preds = CfgAnalysis.predecessors fn in
+  let block_defs =
+    fn.MicroIR.blocks
+    |> List.fold_left
+         (fun acc blk -> CfgAnalysis.SM.add blk.MicroIR.label (defs_of_block blk) acc)
+         CfgAnalysis.SM.empty
+  in
+  let all_defs =
     List.fold_left (fun acc v -> CfgAnalysis.SS.add v acc) CfgAnalysis.SS.empty !defs
   in
+  let labels = CfgAnalysis.labels fn in
+  let init_must_in =
+    List.fold_left
+      (fun acc lbl ->
+        let seed =
+          if lbl = fn.MicroIR.entry then CfgAnalysis.SS.empty else all_defs
+        in
+        CfgAnalysis.SM.add lbl seed acc)
+      CfgAnalysis.SM.empty
+      labels
+  in
+  let add_defs set defs =
+    List.fold_left (fun s v -> CfgAnalysis.SS.add v s) set defs
+  in
+  let pred_out must_in pred_lbl =
+    let pin =
+      match CfgAnalysis.SM.find_opt pred_lbl must_in with
+      | Some x -> x
+      | None -> CfgAnalysis.SS.empty
+    in
+    let pdefs =
+      match CfgAnalysis.SM.find_opt pred_lbl block_defs with
+      | Some xs -> xs
+      | None -> []
+    in
+    add_defs pin pdefs
+  in
+  let rec fix must_in =
+    let changed = ref false in
+    let next =
+      List.fold_left
+        (fun acc lbl ->
+          let in_set =
+            if lbl = fn.MicroIR.entry then
+              CfgAnalysis.SS.empty
+            else
+              match CfgAnalysis.SM.find_opt lbl preds with
+              | Some pred_set -> (
+                  match CfgAnalysis.SS.elements pred_set with
+                  | [] -> CfgAnalysis.SS.empty
+                  | p :: ps ->
+                      List.fold_left
+                        (fun s p' -> CfgAnalysis.SS.inter s (pred_out must_in p'))
+                        (pred_out must_in p)
+                        ps)
+              | None -> CfgAnalysis.SS.empty
+          in
+          let prev =
+            match CfgAnalysis.SM.find_opt lbl must_in with
+            | Some x -> x
+            | None -> CfgAnalysis.SS.empty
+          in
+          if not (CfgAnalysis.SS.equal prev in_set) then changed := true;
+          CfgAnalysis.SM.add lbl in_set acc)
+        CfgAnalysis.SM.empty
+        labels
+    in
+    if !changed then fix next else next
+  in
+  let must_in = fix init_must_in in
   let inputs =
-    !uses |> sort_uniq |> List.filter (fun v -> not (CfgAnalysis.SS.mem v defset))
+    fn.MicroIR.blocks
+    |> List.concat_map (fun blk ->
+           let available =
+             match CfgAnalysis.SM.find_opt blk.MicroIR.label must_in with
+             | Some s -> s
+             | None -> CfgAnalysis.SS.empty
+           in
+           local_uses_before_defs blk
+           |> List.filter (fun v -> not (CfgAnalysis.SS.mem v available)))
+    |> sort_uniq
   in
   {
     fname = fn.MicroIR.fname;

@@ -27,6 +27,14 @@ let sym_expr st =
         | Some e -> e
         | None -> Printf.sprintf "mem[%s]" key)
     | MicroIR.EAddr (v, off) -> Printf.sprintf "addr(%s,%d)" (sym_value st v) off
+    | MicroIR.EIndex (base, idx, width) ->
+        Printf.sprintf
+          "index(%s,%s,%d)"
+          (sym_value st base)
+          (sym_value st idx)
+          width
+    | MicroIR.EField (base, fld) ->
+        Printf.sprintf "field(%s,%s)" (sym_value st base) fld
     | MicroIR.ECmp (pred, a, b) ->
         Printf.sprintf "(%s %s %s)" (sym_value st a) pred (sym_value st b)
   in

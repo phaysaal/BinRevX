@@ -29,15 +29,18 @@ The intended architecture of `BinRevX` addresses those by:
 
 ## Current Status
 
-This is an architecture-first scaffold. It currently provides:
+This is now a working prototype. It currently provides:
 
 - a design document in [ARCHITECTURE.md](/home/faisal/code/hobby/llvmpattern/BinRevX/ARCHITECTURE.md)
-- a small OCaml skeleton for:
-  - canonical IR definitions
-  - loop recovery interfaces
-  - modular summary interfaces
-  - top-level pipeline reporting
-  - a simple text-based `MicroIR` loader
+- a text-based `MicroIR` loader
+- CFG, dominator, and natural-loop recovery
+- region recovery for loops and branch headers
+- symbolic state seeding and block interpretation
+- loop summaries, invariant candidates, and VC stubs
+- loop memory-pattern classification for:
+  - arrays
+  - strings
+  - linked lists
 
 ## Build
 
@@ -50,6 +53,7 @@ make
 ```bash
 ./binrevx
 ./binrevx examples/loops.microir
+./binrevx examples/memory_kinds.microir
 ```
 
 ## MicroIR Input
@@ -84,6 +88,8 @@ Supported statements:
 - `assign <dst> cmp <pred> <a> <b>`
 - `assign <dst> load <ptr>`
 - `assign <dst> addr <base> <offset>`
+- `assign <dst> index <base> <idx> <width>`
+- `assign <dst> field <base> <field>`
 - `store <src> <dstptr>`
 - `assume ...`
 - `assert ...`
@@ -106,3 +112,17 @@ Instead:
 - the lifter translates instructions into a small semantic core,
 - the structurer reasons over CFGs and loop schemas,
 - the symbolic engine reasons over canonical effects, not opcode catalogs.
+
+## Memory Patterns
+
+`BinRevX` now classifies recovered loops by memory behavior rather than only by CFG shape.
+The current loop classifier looks for:
+
+- array traversals: indexed access plus stride progression
+- string traversals: byte-indexed access plus zero-sentinel exit
+- linked-list traversals: field-based pointer chasing plus null exit
+
+Example corpus:
+
+- [examples/loops.microir](/home/faisal/code/hobby/llvmpattern/BinRevX/examples/loops.microir)
+- [examples/memory_kinds.microir](/home/faisal/code/hobby/llvmpattern/BinRevX/examples/memory_kinds.microir)

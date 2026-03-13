@@ -103,6 +103,25 @@ let print_loop_invariants fn =
               ("    missing header state for loop " ^ lp.LoopRecovery.header))
       loops
 
+let print_memory_patterns fn =
+  let _, _, header_states, _ = SymExec.explore_function fn in
+  let loops = LoopRecovery.recover_loops fn in
+  print_endline "  memory-patterns:";
+  if loops = [] then
+    print_endline "    none"
+  else
+    List.iter
+      (fun lp ->
+        match CfgAnalysis.SM.find_opt lp.LoopRecovery.header header_states with
+        | Some st ->
+            let summary = LoopSummary.summarize fn st lp in
+            let pat = MemoryPattern.analyze_loop fn lp summary in
+            print_endline ("    " ^ MemoryPattern.render pat)
+        | None ->
+            print_endline
+              ("    missing header state for loop " ^ lp.LoopRecovery.header))
+      loops
+
 let print_loop_vcs fn =
   let _, _, header_states, _ = SymExec.explore_function fn in
   let loops = LoopRecovery.recover_loops fn in
@@ -137,6 +156,7 @@ let () =
       print_func_summary fn;
       print_func_symbolic fn;
       print_loop_summaries fn;
+      print_memory_patterns fn;
       print_loop_invariants fn;
       print_loop_vcs fn;
       print_endline "")

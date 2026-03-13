@@ -29,6 +29,10 @@ let parse_expr = function
   | [ "val"; v ] -> MicroIR.EVal (parse_value v)
   | [ "load"; v ] -> MicroIR.ELoad (parse_value v)
   | [ "addr"; v; off ] -> MicroIR.EAddr (parse_value v, int_of_string off)
+  | [ "index"; base; idx; width ] ->
+      MicroIR.EIndex (parse_value base, parse_value idx, int_of_string width)
+  | [ "field"; base; fld ] ->
+      MicroIR.EField (parse_value base, fld)
   | [ "binop"; op; a; b ] -> MicroIR.EBinop (op, parse_value a, parse_value b)
   | [ "cmp"; pred; a; b ] -> MicroIR.ECmp (pred, parse_value a, parse_value b)
   | xs ->

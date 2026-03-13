@@ -8,6 +8,8 @@ type expr =
   | EBinop of string * value * value
   | ELoad of value
   | EAddr of value * int
+  | EIndex of value * value * int
+  | EField of value * string
   | ECmp of string * value * value
 
 type instr =
@@ -50,6 +52,10 @@ let string_of_expr =
         Printf.sprintf "(%s %s %s)" (string_of_value a) op (string_of_value b)
     | ELoad v -> Printf.sprintf "load(%s)" (string_of_value v)
     | EAddr (v, off) -> Printf.sprintf "addr(%s,%d)" (string_of_value v) off
+    | EIndex (base, idx, width) ->
+        Printf.sprintf "index(%s,%s,%d)" (string_of_value base) (string_of_value idx) width
+    | EField (base, fld) ->
+        Printf.sprintf "field(%s,%s)" (string_of_value base) fld
     | ECmp (pred, a, b) ->
         Printf.sprintf "(%s %s %s)" (string_of_value a) pred (string_of_value b)
   in

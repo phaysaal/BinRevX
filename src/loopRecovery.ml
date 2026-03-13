@@ -61,6 +61,8 @@ let used_expr = function
   | MicroIR.EBinop (_, a, b) -> used_value a @ used_value b
   | MicroIR.ELoad v -> used_value v
   | MicroIR.EAddr (v, _) -> used_value v
+  | MicroIR.EIndex (base, idx, _) -> used_value base @ used_value idx
+  | MicroIR.EField (base, _) -> used_value base
   | MicroIR.ECmp (_, a, b) -> used_value a @ used_value b
 
 let used_of_instr = function

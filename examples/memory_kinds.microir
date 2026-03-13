@@ -1,0 +1,45 @@
+# Array, string, and linked-list loop patterns for BinRevX
+
+func array_sum entry entry
+block entry
+assign i const 0
+assign sum const 0
+term jump hdr
+block hdr
+term branch lt i n body exit
+block body
+assign elt index a i 4
+assign sum binop add sum elt
+assign i binop add i 1
+term jump hdr
+block exit
+term ret sum
+endfunc
+
+func string_len entry entry
+block entry
+assign i const 0
+term jump hdr
+block hdr
+assign ch index s i 1
+term branch ne ch 0 body exit
+block body
+assign i binop add i 1
+term jump hdr
+block exit
+term ret i
+endfunc
+
+func list_len entry entry
+block entry
+assign n const 0
+term jump hdr
+block hdr
+term branch ne head 0 body exit
+block body
+assign n binop add n 1
+assign head field head next
+term jump hdr
+block exit
+term ret n
+endfunc
