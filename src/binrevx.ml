@@ -56,6 +56,10 @@ let load_prog () =
 let print_func_loops fn =
   let loops = LoopRecovery.recover_loops fn in
   Printf.printf "Function %s:\n" fn.MicroIR.fname;
+  Printf.printf
+    "  signature: params=[%s] ret=%s\n"
+    (String.concat "," fn.MicroIR.params)
+    (match fn.MicroIR.ret with Some r -> r | None -> "void");
   if loops = [] then
     print_endline "  no loop recovered"
   else

@@ -87,6 +87,8 @@ type block_acc = {
 type func_acc = {
   fname : string;
   entry : string;
+  params : string list;
+  ret : string option;
   blocks_rev : MicroIR.block list;
   current : block_acc option;
 }
@@ -105,15 +107,37 @@ let finish_func acc =
       {
         MicroIR.fname = acc.fname;
         entry = acc.entry;
+        params = acc.params;
+        ret = acc.ret;
         blocks = List.rev acc.blocks_rev;
       }
 
-let parse_func_header = function
-  | [ "func"; fname; "entry"; entry ] -> (fname, entry)
+let parse_func_header toks =
+  match toks with
+  | "func" :: fname :: "entry" :: entry :: rest ->
+      let rec parse_tail params ret = function
+        | [] -> (fname, entry, List.rev params, ret)
+        | "params" :: xs ->
+            let rec take_params acc = function
+              | [] -> (List.rev acc, [])
+              | "ret" :: _ as rest -> (List.rev acc, rest)
+              | x :: rest -> take_params (x :: acc) rest
+            in
+            let params', rest = take_params params xs in
+            parse_tail params' ret rest
+        | [ "ret"; r ] -> (fname, entry, List.rev params, Some r)
+        | "ret" :: r :: rest -> parse_tail params (Some r) rest
+        | xs ->
+            raise
+              (Parse_error
+                 ("bad function header tail: " ^ String.concat " " xs))
+      in
+      parse_tail [] None rest
   | xs ->
       raise
         (Parse_error
-           ("expected 'func <name> entry <label>', got: " ^ String.concat " " xs))
+           ("expected 'func <name> entry <label> [params ...] [ret r]', got: "
+          ^ String.concat " " xs))
 
 let read_lines path =
   let ic = open_in path in
@@ -143,8 +167,10 @@ let load path =
             | Some acc -> finish_func acc :: funcs
             | None -> funcs
           in
-          let fname, entry = parse_func_header (split_words line) in
-          loop current_funcs (Some { fname; entry; blocks_rev = []; current = None }) rest
+          let fname, entry, params, ret = parse_func_header (split_words line) in
+          loop current_funcs
+            (Some { fname; entry; params; ret; blocks_rev = []; current = None })
+            rest
         else if line = "endfunc" then
           match current with
           | Some acc -> loop (finish_func acc :: funcs) None rest

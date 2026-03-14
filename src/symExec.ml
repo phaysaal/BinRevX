@@ -6,7 +6,7 @@ type branch_state = {
 module SM = Map.Make (String)
 
 let from_summary (s : ModSummary.summary) =
-  SymState.of_inputs s.ModSummary.pre
+  SymState.of_inputs (s.ModSummary.params @ s.ModSummary.pre)
 
 let sym_value st = function
   | MicroIR.VReg v -> (

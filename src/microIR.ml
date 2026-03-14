@@ -35,6 +35,8 @@ type block = {
 type func = {
   fname : string;
   entry : string;
+  params : string list;
+  ret : string option;
   blocks : block list;
 }
 
@@ -111,7 +113,13 @@ let loop_example =
   let exit =
     { label = "exit"; body = []; term = TReturn (Some (VReg "sum")) }
   in
-  { fname = "sum_to_ten"; entry = "entry"; blocks = [ entry; hdr; body; exit ] }
+  {
+    fname = "sum_to_ten";
+    entry = "entry";
+    params = [];
+    ret = Some "sum";
+    blocks = [ entry; hdr; body; exit ];
+  }
 
 let branch_example =
   let entry =
@@ -130,6 +138,17 @@ let branch_example =
   let join =
     { label = "join"; body = []; term = TReturn (Some (VReg "r")) }
   in
-  { fname = "branch_only"; entry = "entry"; blocks = [ entry; then0; else0; join ] }
+  {
+    fname = "branch_only";
+    entry = "entry";
+    params = [ "x" ];
+    ret = Some "r";
+    blocks = [ entry; then0; else0; join ];
+  }
 
-let sample_prog = [ { fname = "main"; entry = "entry"; blocks = [ sample_block ] }; loop_example; branch_example ]
+let sample_prog =
+  [
+    { fname = "main"; entry = "entry"; params = []; ret = Some "r0"; blocks = [ sample_block ] };
+    loop_example;
+    branch_example;
+  ]

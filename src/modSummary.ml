@@ -1,5 +1,6 @@
 type summary = {
   fname : string;
+  params : string list;
   pre : string list;
   post : string list;
   modifies : string list;
@@ -54,6 +55,7 @@ let uses_of_term = function
 let empty fname =
   {
     fname;
+    params = [];
     pre = [];
     post = [];
     modifies = [];
@@ -190,21 +192,37 @@ let infer (fn : MicroIR.func) =
            |> List.filter (fun v -> not (CfgAnalysis.SS.mem v available)))
     |> sort_uniq
   in
+  let params = sort_uniq fn.MicroIR.params in
+  let ambient_inputs =
+    inputs |> List.filter (fun v -> not (List.mem v params))
+  in
+  let returns =
+    match fn.MicroIR.ret, sort_uniq !returns with
+    | Some r, rs when List.mem r rs -> Some r
+    | Some r, _ -> Some r
+    | None, [] -> None
+    | None, r :: _ -> Some r
+  in
   {
     fname = fn.MicroIR.fname;
-    pre = inputs;
+    params;
+    pre = ambient_inputs;
     post =
-      (if loops = [] then [] else [ "loops=" ^ string_of_int (List.length loops) ])
-      @ List.map (fun r -> "ret=" ^ r) (sort_uniq !returns);
+      ((if loops = [] then [] else [ "loops=" ^ string_of_int (List.length loops) ])
+      @
+      match returns with
+      | Some r -> [ "ret=" ^ r ]
+      | None -> []);
     modifies = sort_uniq !modifies;
-    returns = (match sort_uniq !returns with [] -> None | r :: _ -> Some r);
+    returns;
     calls = sort_uniq !calls;
   }
 
 let render s =
   Printf.sprintf
-    "summary(%s): pre=[%s] post=[%s] modifies=[%s] calls=[%s]"
+    "summary(%s): params=[%s] pre=[%s] post=[%s] modifies=[%s] calls=[%s]"
     s.fname
+    (String.concat "," s.params)
     (String.concat "," s.pre)
     (String.concat "," s.post)
     (String.concat "," s.modifies)

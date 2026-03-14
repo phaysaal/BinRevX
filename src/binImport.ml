@@ -10,6 +10,8 @@ type asm_instr = {
   operands : string list;
 }
 
+type abi = X86_32
+
 let trim = String.trim
 
 let split_words s =
@@ -26,6 +28,11 @@ let sanitize s =
   Buffer.contents buf
 
 let label_of_addr a = "L_" ^ sanitize a
+
+let rec take n xs =
+  match n, xs with
+  | 0, _ | _, [] -> []
+  | n, x :: rest -> x :: take (n - 1) rest
 
 let run_lines cmd =
   let ic = Unix.open_process_in cmd in
@@ -112,25 +119,68 @@ let clean_mem_operand s =
   |> drop_prefix "WORD PTR "
   |> trim
 
-let parse_value tok =
+let parse_disp s =
+  let s = trim s in
+  if s = "" then Some 0
+  else parse_int_opt s
+
+let ebp_stack_offset tok =
+  let tok = clean_mem_operand tok in
+  if String.length tok >= 5 && tok.[0] = '[' && tok.[String.length tok - 1] = ']'
+  then
+    let inner = String.sub tok 1 (String.length tok - 2) in
+    if inner = "ebp" then Some 0
+    else if String.length inner > 4 && String.sub inner 0 4 = "ebp+" then
+      parse_disp (String.sub inner 4 (String.length inner - 4))
+    else if String.length inner > 4 && String.sub inner 0 4 = "ebp-" then
+      parse_disp ("-" ^ String.sub inner 4 (String.length inner - 4))
+    else
+      None
+  else
+    None
+
+let infer_x86_32_params instrs =
+  let offsets =
+    instrs
+    |> List.concat_map (fun i -> i.operands)
+    |> List.filter_map ebp_stack_offset
+    |> List.filter (fun off -> off >= 8 && off mod 4 = 0)
+    |> List.sort_uniq Int.compare
+  in
+  let params = List.mapi (fun i _ -> Printf.sprintf "arg%d" i) offsets in
+  List.combine offsets params
+
+let value_of_operand param_map tok =
   let tok = trim tok in
   let tok = clean_mem_operand tok in
   if tok = "" then MicroIR.VUndef
-  else if tok.[0] = '[' then
-    MicroIR.VReg ("mem_" ^ sanitize tok)
   else
-    match parse_int_opt tok with
-    | Some n -> MicroIR.VConst n
-    | None -> MicroIR.VReg (sanitize tok)
+    match ebp_stack_offset tok with
+    | Some off when off >= 8 -> (
+        match List.assoc_opt off param_map with
+        | Some name -> MicroIR.VReg name
+        | None -> MicroIR.VReg ("arg_" ^ string_of_int off))
+    | _ ->
+        if tok.[0] = '[' then
+          MicroIR.VReg ("mem_" ^ sanitize tok)
+        else
+          match parse_int_opt tok with
+          | Some n -> MicroIR.VConst n
+          | None -> MicroIR.VReg (sanitize tok)
 
-let parse_mem_access tok =
+let parse_mem_access param_map tok =
   let tok = clean_mem_operand tok in
   if String.length tok >= 2 && tok.[0] = '[' && tok.[String.length tok - 1] = ']'
   then
     let inner = String.sub tok 1 (String.length tok - 2) in
-    MicroIR.VReg (sanitize inner)
+    (match ebp_stack_offset tok with
+    | Some off when off >= 8 -> (
+        match List.assoc_opt off param_map with
+        | Some name -> MicroIR.VReg name
+        | None -> MicroIR.VReg ("arg_" ^ string_of_int off))
+    | _ -> MicroIR.VReg (sanitize inner))
   else
-    parse_value tok
+    value_of_operand param_map tok
 
 let jcc_pred = function
   | "je" | "jz" -> Some "eq"
@@ -152,32 +202,77 @@ let target_of_operand op =
 
 let pending_cmp_of_instr = function
   | { mnemonic = "cmp"; operands = [ a; b ]; _ } ->
-      Some (parse_value a, parse_value b)
-  | { mnemonic = "test"; operands = [ a; b ]; _ } when trim a = trim b ->
-      Some (parse_value a, MicroIR.VConst 0)
+      Some (a, b)
+  | { mnemonic = "test"; operands = [ a; b ]; _ } when trim a = trim b -> Some (a, "0")
   | _ -> None
 
-let translate_nonterm i =
-  match i.mnemonic, i.operands with
-  | "mov", [ dst; src ] ->
-      Some (MicroIR.IAssign (sanitize dst, MicroIR.EVal (parse_value src)))
-  | "lea", [ dst; src ] ->
-      Some (MicroIR.IAssign (sanitize dst, MicroIR.EAddr (parse_mem_access src, 0)))
-  | ("add" | "sub" as op), [ dst; src ] ->
-      let dstv = sanitize dst in
-      Some (MicroIR.IAssign (dstv, MicroIR.EBinop (op, MicroIR.VReg dstv, parse_value src)))
-  | "xor", [ a; b ] when trim a = trim b ->
-      Some (MicroIR.IAssign (sanitize a, MicroIR.EVal (MicroIR.VConst 0)))
-  | "movzx", [ dst; src ] ->
-      Some (MicroIR.IAssign (sanitize dst, MicroIR.ELoad (parse_mem_access src)))
-  | "call", callee :: _ ->
-      Some (MicroIR.ICall (None, parse_value callee, []))
-  | _ -> None
+let is_stack_setup = function
+  | { mnemonic = "sub"; operands = [ dst; _ ]; _ }
+  | { mnemonic = "add"; operands = [ dst; _ ]; _ } ->
+      sanitize dst = "esp"
+  | _ -> false
 
-let build_blocks fname instrs =
+let translate_block_body abi param_map insns =
+  let rec loop pending_args acc = function
+    | [] -> List.rev acc
+    | i :: rest -> (
+        match i.mnemonic, i.operands with
+        | "push", [ src ] ->
+            loop (value_of_operand param_map src :: pending_args) acc rest
+        | "call", callee :: _ ->
+            let args = List.rev pending_args in
+            let ret =
+              match abi with
+              | X86_32 -> Some "eax"
+            in
+            let ins = MicroIR.ICall (ret, value_of_operand param_map callee, args) in
+            loop [] (ins :: acc) rest
+        | "mov", [ dst; src ] ->
+            let ins =
+              MicroIR.IAssign (sanitize dst, MicroIR.EVal (value_of_operand param_map src))
+            in
+            loop [] (ins :: acc) rest
+        | "lea", [ dst; src ] ->
+            let ins =
+              MicroIR.IAssign (sanitize dst, MicroIR.EAddr (parse_mem_access param_map src, 0))
+            in
+            loop [] (ins :: acc) rest
+        | ("add" | "sub" as op), [ dst; src ] ->
+            let dstv = sanitize dst in
+            let ins =
+              MicroIR.IAssign
+                (dstv, MicroIR.EBinop (op, MicroIR.VReg dstv, value_of_operand param_map src))
+            in
+            if dstv = "esp" && pending_args <> [] then
+              loop pending_args acc rest
+            else
+              loop [] (ins :: acc) rest
+        | "xor", [ a; b ] when trim a = trim b ->
+            let ins =
+              MicroIR.IAssign (sanitize a, MicroIR.EVal (MicroIR.VConst 0))
+            in
+            loop [] (ins :: acc) rest
+        | "movzx", [ dst; src ] ->
+            let ins =
+              MicroIR.IAssign (sanitize dst, MicroIR.ELoad (parse_mem_access param_map src))
+            in
+            loop [] (ins :: acc) rest
+        | _ ->
+            let pending_args =
+              if pending_args <> [] && not (is_stack_setup i) then [] else pending_args
+            in
+            loop pending_args acc rest)
+  in
+  loop [] [] insns
+
+let build_blocks abi fname params ret instrs =
   match instrs with
   | [] -> raise (Import_error ("no disassembly for function " ^ fname))
   | _ ->
+      let param_map =
+        match abi with
+        | X86_32 -> infer_x86_32_params instrs
+      in
       let addrs = List.map (fun i -> i.addr) instrs in
       let next_addr =
         let rec pairs acc = function
@@ -245,14 +340,18 @@ let build_blocks fname instrs =
             insns
         in
         let body =
-          insns
-          |> List.rev |> List.tl |> List.rev
-          |> List.filter_map translate_nonterm
+          insns |> List.rev |> List.tl |> List.rev |> translate_block_body abi param_map
         in
         let last = List.hd (List.rev insns) in
         let term =
           match last.mnemonic, last.operands with
-          | "ret", _ -> MicroIR.TReturn None
+          | "ret", _ ->
+              let rv =
+                match ret with
+                | Some r -> Some (MicroIR.VReg r)
+                | None -> None
+              in
+              MicroIR.TReturn rv
           | "jmp", op :: _ -> (
               match target_of_operand op with
               | Some a -> MicroIR.TJump (label_of_addr a)
@@ -261,7 +360,7 @@ let build_blocks fname instrs =
               let pred = Option.get (jcc_pred m) in
               let lhs, rhs =
                 match pending with
-                | Some (a, b) -> (a, b)
+                | Some (a, b) -> (value_of_operand param_map a, value_of_operand param_map b)
                 | None -> (MicroIR.VReg "flag", MicroIR.VConst 0)
               in
               let tlabel =
@@ -286,17 +385,14 @@ let build_blocks fname instrs =
       {
         MicroIR.fname = fname;
         entry = label_of_addr (List.hd instrs).addr;
+        params;
+        ret;
         blocks;
       }
 
 let import ?(func = "main") path =
   let funcs = defined_functions path in
   if not (List.mem func funcs) then
-    let rec take n xs =
-      match n, xs with
-      | 0, _ | _, [] -> []
-      | n, x :: rest -> x :: take (n - 1) rest
-    in
     let sample =
       funcs
       |> List.sort_uniq String.compare
@@ -309,4 +405,7 @@ let import ?(func = "main") path =
         ^ String.concat ", " sample))
   else
     let instrs = disassemble_function path func in
-    [ build_blocks func instrs ]
+    let params =
+      infer_x86_32_params instrs |> List.map snd
+    in
+    [ build_blocks X86_32 func params (Some "eax") instrs ]
