@@ -17,6 +17,7 @@ let starts_with s prefix =
 
 let summary_noise v =
   v = "esp" || v = "rsp" || v = "ebp" || v = "rbp" || v = "sp" || v = "fp"
+  || v = "ebx" || v = "ecx" || v = "edx" || v = "esi" || v = "edi"
   || v = "rdi" || v = "rsi" || v = "rdx" || v = "rcx" || v = "r8" || v = "r9"
   || v = "r0" || v = "r1" || v = "r2" || v = "r3"
   || v = "flag"

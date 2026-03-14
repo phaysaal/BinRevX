@@ -15,6 +15,23 @@ type abi =
   | X86_64
   | ARM_32
 
+type sec_info = {
+  s_name : string;
+  s_addr : int;
+  s_off : int;
+  s_size : int;
+}
+
+type resolver = {
+  pic_base : int option;
+  relocs : (int * string) list;
+  symbols : (int * string) list;
+  sections : sec_info list;
+  path : string;
+}
+
+let current_resolver : resolver option ref = ref None
+
 let trim = String.trim
 
 let split_words s =
@@ -42,6 +59,8 @@ let rec zip xs ys =
   | x :: xs, y :: ys -> (x, y) :: zip xs ys
   | _ -> []
 
+let hex_of_int n = Printf.sprintf "0x%x" n
+
 let run_lines cmd =
   let ic = Unix.open_process_in cmd in
   let rec loop acc =
@@ -54,6 +73,33 @@ let run_lines cmd =
   in
   loop []
 
+let read_file_slice path off len =
+  let ic = open_in_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_in_noerr ic)
+    (fun () ->
+      seek_in ic off;
+      really_input_string ic len)
+
+let read_c_string path off max_len =
+  try
+    let raw = read_file_slice path off max_len in
+    let buf = Buffer.create max_len in
+    let printable = ref 0 in
+    String.iter
+      (fun c ->
+        if c <> '\000' then (
+          let code = Char.code c in
+          if code >= 32 && code < 127 then printable := !printable + 1;
+          Buffer.add_char buf c))
+      (try
+         let nul = String.index raw '\000' in
+         String.sub raw 0 nul
+       with Not_found -> raw);
+    let s = Buffer.contents buf |> trim in
+    if s = "" || !printable = 0 then None else Some s
+  with _ -> None
+
 let defined_functions path =
   let cmd = "nm -C --defined-only " ^ Filename.quote path in
   run_lines cmd
@@ -61,6 +107,149 @@ let defined_functions path =
          match split_words line with
          | [ _addr; _kind; name ] -> Some name
          | _ -> None)
+
+let sanitize_symbol_name s =
+  let s =
+    match String.index_opt s '@' with
+    | Some i when i > 0 -> String.sub s 0 i
+    | _ -> s
+  in
+  sanitize s
+
+let parse_hex_opt s =
+  try Some (int_of_string s) with _ -> None
+
+let clean_mem_operand0 s =
+  let drop pref s =
+    let n = String.length pref in
+    if String.length s >= n && String.sub s 0 n = pref then
+      String.sub s n (String.length s - n)
+    else
+      s
+  in
+  s
+  |> drop "BYTE PTR "
+  |> drop "DWORD PTR "
+  |> drop "QWORD PTR "
+  |> drop "WORD PTR "
+  |> trim
+
+let parse_section_line line =
+  let toks = split_words line in
+  match toks with
+  | idx :: name :: _typ :: addr :: off :: size :: _ when String.starts_with ~prefix:"[" idx -> (
+      match parse_hex_opt ("0x" ^ addr), parse_hex_opt ("0x" ^ off), parse_hex_opt ("0x" ^ size) with
+      | Some s_addr, Some s_off, Some s_size ->
+          Some { s_name = name; s_addr; s_off; s_size }
+      | _ -> None)
+  | _ -> None
+
+let section_info path =
+  run_lines ("readelf -S " ^ Filename.quote path) |> List.filter_map parse_section_line
+
+let relocation_info path =
+  run_lines ("objdump -R " ^ Filename.quote path)
+  |> List.filter_map (fun line ->
+         match split_words line with
+         | off :: _typ :: sym :: _ -> (
+             match parse_hex_opt ("0x" ^ off) with
+             | Some addr -> Some (addr, sanitize_symbol_name sym)
+             | None -> None)
+         | _ -> None)
+
+let symbol_info path =
+  run_lines ("nm -n -C " ^ Filename.quote path)
+  |> List.filter_map (fun line ->
+         match split_words line with
+         | addr :: _kind :: rest when rest <> [] -> (
+             match parse_hex_opt ("0x" ^ addr) with
+             | Some a -> Some (a, sanitize_symbol_name (String.concat "_" rest))
+             | None -> None)
+         | _ -> None)
+
+let infer_x86_pic_base instrs =
+  let rec find = function
+    | { addr; mnemonic = "add"; operands = [ dst; src ]; _ } :: _
+      when String.lowercase_ascii (trim dst) = "ebx" -> (
+          match parse_hex_opt src, parse_hex_opt ("0x" ^ addr) with
+          | Some imm, Some here -> Some (here + imm)
+          | _ -> None)
+    | _ :: rest -> find rest
+    | [] -> None
+  in
+  find instrs
+
+let build_resolver abi path instrs =
+  let pic_base =
+    match abi with
+    | X86_32 -> infer_x86_pic_base instrs
+    | _ -> None
+  in
+  {
+    pic_base;
+    relocs = relocation_info path;
+    symbols = symbol_info path;
+    sections = section_info path;
+    path;
+  }
+
+let parse_pic_disp tok =
+  let tok = clean_mem_operand0 tok |> trim in
+  if String.length tok >= 5 && tok.[0] = '[' && tok.[String.length tok - 1] = ']'
+  then
+    let inner = String.sub tok 1 (String.length tok - 2) |> String.lowercase_ascii |> trim in
+    if inner = "ebx" then Some 0
+    else if String.starts_with ~prefix:"ebx+" inner then
+      parse_hex_opt (String.sub inner 4 (String.length inner - 4))
+    else if String.starts_with ~prefix:"ebx-" inner then
+      parse_hex_opt ("-" ^ String.sub inner 4 (String.length inner - 4))
+    else
+      None
+  else
+    None
+
+let section_of_addr sections addr =
+  sections
+  |> List.find_opt (fun s -> addr >= s.s_addr && addr < s.s_addr + s.s_size)
+
+let nearest_symbol symbols addr =
+  symbols
+  |> List.fold_left
+       (fun best (a, name) ->
+         if a > addr then best
+         else
+           match best with
+           | Some (b, _) when b > a -> best
+           | _ -> Some (a, name))
+       None
+
+let resolve_absolute_symbol r addr =
+  match List.assoc_opt addr r.relocs with
+  | Some sym -> Some ("got_" ^ sym)
+  | None -> (
+      match List.assoc_opt addr r.symbols with
+      | Some sym -> Some sym
+      | None -> (
+          match section_of_addr r.sections addr with
+          | Some sec when sec.s_name = ".rodata" -> (
+              let off = sec.s_off + (addr - sec.s_addr) in
+              match read_c_string r.path off 32 with
+              | Some s -> Some ("str_" ^ sanitize s)
+              | None -> Some ("rodata_" ^ sanitize (hex_of_int addr)))
+          | Some sec -> Some (sanitize sec.s_name ^ "_" ^ sanitize (hex_of_int addr))
+          | None -> (
+              match nearest_symbol r.symbols addr with
+              | Some (base, sym) when addr - base <= 64 ->
+                  Some (sym ^ "_plus_" ^ sanitize (hex_of_int (addr - base)))
+              | _ -> None)))
+
+let resolve_pic_symbol tok =
+  match !current_resolver with
+  | Some r -> (
+      match r.pic_base, parse_pic_disp tok with
+      | Some base, Some disp -> resolve_absolute_symbol r (base + disp)
+      | _ -> None)
+  | None -> None
 
 let split_tabs s =
   String.split_on_char '\t' s |> List.filter (fun x -> trim x <> "")
@@ -438,34 +627,48 @@ let value_of_operand abi aliases tok =
   if tok = "" then
     MicroIR.VUndef
   else
-    match lookup_stack_alias abi aliases tok with
+    match resolve_pic_symbol tok with
     | Some name -> MicroIR.VReg name
     | None ->
-        if is_memory_operand tok then
-          MicroIR.VReg ("mem_" ^ sanitize tok)
-        else
-          match parse_int_opt tok with
-          | Some n -> MicroIR.VConst n
-          | None -> (
-              match canonical_reg abi tok with
-              | Some r -> MicroIR.VReg r
-              | None -> (
-                  match extract_symbol_name tok with
-                  | Some name -> MicroIR.VReg name
-                  | None -> MicroIR.VReg (sanitize tok)))
+        begin
+          match lookup_stack_alias abi aliases tok with
+          | Some name -> MicroIR.VReg name
+          | None ->
+              if is_memory_operand tok then
+                MicroIR.VReg ("mem_" ^ sanitize tok)
+              else
+                begin
+                  match parse_int_opt tok with
+                  | Some n -> MicroIR.VConst n
+                  | None ->
+                      begin
+                        match canonical_reg abi tok with
+                        | Some r -> MicroIR.VReg r
+                        | None ->
+                            begin
+                              match extract_symbol_name tok with
+                              | Some name -> MicroIR.VReg name
+                              | None -> MicroIR.VReg (sanitize tok)
+                            end
+                      end
+                end
+        end
 
 let parse_mem_access abi aliases tok =
   let tok = clean_mem_operand tok in
-  if is_memory_operand tok then
-    let inner = String.sub tok 1 (String.length tok - 2) in
-    match lookup_stack_alias abi aliases tok with
-    | Some name -> MicroIR.VReg name
-    | None -> (
-        match canonical_reg abi inner with
-        | Some r -> MicroIR.VReg r
-        | None -> MicroIR.VReg (sanitize inner))
-  else
-    value_of_operand abi aliases tok
+  match resolve_pic_symbol tok with
+  | Some name -> MicroIR.VReg name
+  | None ->
+      if is_memory_operand tok then
+        let inner = String.sub tok 1 (String.length tok - 2) in
+        match lookup_stack_alias abi aliases tok with
+        | Some name -> MicroIR.VReg name
+        | None -> (
+            match canonical_reg abi inner with
+            | Some r -> MicroIR.VReg r
+            | None -> MicroIR.VReg (sanitize inner))
+      else
+        value_of_operand abi aliases tok
 
 let stack_alias_of_operand abi aliases tok =
   lookup_stack_alias abi aliases (clean_mem_operand tok)
@@ -945,6 +1148,7 @@ let import ?(func = "main") path =
   else
     let abi = detect_abi path in
     let instrs = disassemble_function abi path func in
+    current_resolver := Some (build_resolver abi path instrs);
     let params_aliases = param_aliases abi instrs in
     let aliases = params_aliases @ local_aliases abi instrs in
     let params = param_names params_aliases in
