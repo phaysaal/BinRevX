@@ -3,7 +3,7 @@ SRC_DIR:=src
 TOOLS:=binrevx
 
 TARGET:=native
-OCAMLBUILDFLAGS:=-classic-display -j 0
+OCAMLBUILDFLAGS:=-classic-display -j 0 -libs unix
 OCAMLBUILD:=ocamlbuild
 
 .PHONY: $(TOOLS) default

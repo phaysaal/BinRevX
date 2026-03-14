@@ -33,6 +33,7 @@ This is now a working prototype. It currently provides:
 
 - a design document in [ARCHITECTURE.md](/home/faisal/code/hobby/llvmpattern/BinRevX/ARCHITECTURE.md)
 - a text-based `MicroIR` loader
+- a single-function ELF importer for symbolized binaries
 - CFG, dominator, and natural-loop recovery
 - region recovery for loops and branch headers
 - symbolic state seeding and block interpretation
@@ -54,7 +55,12 @@ make
 ./binrevx
 ./binrevx examples/loops.microir
 ./binrevx examples/memory_kinds.microir
+./binrevx --func main ../bins/ecdsa_sign_openssl-O0_32
+./binrevx --func ecdsa_sign_tester ../bins/ecdsa_sign_openssl-O0_32
 ```
+
+When the input is an ELF binary, `BinRevX` imports one symbolized function at a time.
+This path is currently aimed at structural recovery rather than full instruction-faithful lifting.
 
 ## MicroIR Input
 
@@ -112,6 +118,26 @@ Instead:
 - the lifter translates instructions into a small semantic core,
 - the structurer reasons over CFGs and loop schemas,
 - the symbolic engine reasons over canonical effects, not opcode catalogs.
+
+## ELF Import Scope
+
+The current ELF importer is intentionally narrow.
+It uses `nm` and `objdump` to import one function and lift a small subset of Intel-style x86 instructions into `MicroIR`.
+
+What it is good for:
+
+- wrapper detection
+- branch recovery
+- back-edge and loop discovery
+- coarse symbolic states for selected functions
+
+Current limits:
+
+- one function at a time via `--func`
+- requires symbols to be present in the binary
+- partial instruction coverage
+- approximate memory semantics
+- memory-pattern classification on imported assembly is still weaker than on hand-authored `MicroIR`
 
 ## Memory Patterns
 

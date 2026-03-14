@@ -16,6 +16,8 @@ let print_reasoning () =
     "  Lift instructions into a canonical MicroIR, then recover loops and summaries.";
   print_endline ""
 
+let binary_func = ref "main"
+
 let is_elf_file path =
   let ic = open_in_bin path in
   Fun.protect
@@ -28,20 +30,28 @@ let is_elf_file path =
       b0 = 0x7f && b1 = Char.code 'E' && b2 = Char.code 'L' && b3 = Char.code 'F')
 
 let load_prog () =
-  match Array.to_list Sys.argv with
-  | [ _ ] -> ("built-in sample", MicroIR.sample_prog)
-  | [ _; path ] ->
-      if is_elf_file path then begin
-        prerr_endline
-          ("error: raw ELF binaries are not accepted by BinRevX: " ^ path);
-        prerr_endline
-          "hint: first lift the binary into MicroIR, or use BinRevZ for direct ELF analysis.";
-        exit 2
-      end;
-      (path, MicroIRParser.load path)
-  | _ ->
-      prerr_endline "usage: ./binrevx [program.microir]";
-      exit 2
+  let rec parse path = function
+    | [] -> path
+    | "--func" :: name :: rest ->
+        binary_func := name;
+        parse path rest
+    | arg :: rest ->
+        if path = None then
+          parse (Some arg) rest
+        else begin
+          prerr_endline ("unexpected argument: " ^ arg);
+          exit 2
+        end
+  in
+  let path = parse None (Array.to_list Sys.argv |> List.tl) in
+  match path with
+  | None -> ("built-in sample", MicroIR.sample_prog)
+  | Some path ->
+      if is_elf_file path then
+        ( path ^ " [func=" ^ !binary_func ^ "]",
+          BinImport.import ~func:!binary_func path )
+      else
+        (path, MicroIRParser.load path)
 
 let print_func_loops fn =
   let loops = LoopRecovery.recover_loops fn in
@@ -85,8 +95,16 @@ let print_func_symbolic fn =
       (fun bs -> print_endline ("    " ^ SymExec.render_branch_state bs))
       states
 
+let find_loop_state header header_states states =
+  match CfgAnalysis.SM.find_opt header header_states with
+  | Some st -> Some st
+  | None ->
+      states
+      |> List.find_map (fun (bs : SymExec.branch_state) ->
+             if bs.state.SymState.location = header then Some bs.state else None)
+
 let print_loop_summaries fn =
-  let _, _, header_states, _ = SymExec.explore_function fn in
+  let _, _, header_states, states = SymExec.explore_function fn in
   let loops = LoopRecovery.recover_loops fn in
   print_endline "  loop-summaries:";
   if loops = [] then
@@ -94,7 +112,7 @@ let print_loop_summaries fn =
   else
     List.iter
       (fun lp ->
-        match CfgAnalysis.SM.find_opt lp.LoopRecovery.header header_states with
+        match find_loop_state lp.LoopRecovery.header header_states states with
         | Some st ->
             let s = LoopSummary.summarize fn st lp in
             print_endline ("    " ^ LoopSummary.render s)
@@ -104,7 +122,7 @@ let print_loop_summaries fn =
       loops
 
 let print_loop_invariants fn =
-  let _, _, header_states, _ = SymExec.explore_function fn in
+  let _, _, header_states, states = SymExec.explore_function fn in
   let loops = LoopRecovery.recover_loops fn in
   print_endline "  invariants:";
   if loops = [] then
@@ -112,7 +130,7 @@ let print_loop_invariants fn =
   else
     List.iter
       (fun lp ->
-        match CfgAnalysis.SM.find_opt lp.LoopRecovery.header header_states with
+        match find_loop_state lp.LoopRecovery.header header_states states with
         | Some st ->
             let summary = LoopSummary.summarize fn st lp in
             let pat = MemoryPattern.analyze_loop fn lp summary in
@@ -124,7 +142,7 @@ let print_loop_invariants fn =
       loops
 
 let print_memory_patterns fn =
-  let _, _, header_states, _ = SymExec.explore_function fn in
+  let _, _, header_states, states = SymExec.explore_function fn in
   let loops = LoopRecovery.recover_loops fn in
   print_endline "  memory-patterns:";
   if loops = [] then
@@ -132,7 +150,7 @@ let print_memory_patterns fn =
   else
     List.iter
       (fun lp ->
-        match CfgAnalysis.SM.find_opt lp.LoopRecovery.header header_states with
+        match find_loop_state lp.LoopRecovery.header header_states states with
         | Some st ->
             let summary = LoopSummary.summarize fn st lp in
             let pat = MemoryPattern.analyze_loop fn lp summary in
@@ -143,7 +161,7 @@ let print_memory_patterns fn =
       loops
 
 let print_loop_vcs fn =
-  let _, _, header_states, _ = SymExec.explore_function fn in
+  let _, _, header_states, states = SymExec.explore_function fn in
   let loops = LoopRecovery.recover_loops fn in
   print_endline "  vcs:";
   if loops = [] then
@@ -151,7 +169,7 @@ let print_loop_vcs fn =
   else
     List.iter
       (fun lp ->
-        match CfgAnalysis.SM.find_opt lp.LoopRecovery.header header_states with
+        match find_loop_state lp.LoopRecovery.header header_states states with
         | Some st ->
             let summary = LoopSummary.summarize fn st lp in
             let pat = MemoryPattern.analyze_loop fn lp summary in

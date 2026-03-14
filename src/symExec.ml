@@ -119,9 +119,30 @@ let states_at_region_headers fn seed =
               let next_q =
                 match blk.MicroIR.term with
                 | MicroIR.TJump succ ->
-                    if CfgAnalysis.SS.mem succ loop_header_set then (succ, st_body) :: qs
-                    else (succ, st_body) :: qs
-                | MicroIR.TBranch _ | MicroIR.TSwitch _ | MicroIR.TReturn _ | MicroIR.TStop -> qs
+                    (succ, st_body) :: qs
+                | MicroIR.TBranch (g, t_lbl, f_lbl) ->
+                    ( t_lbl,
+                      st_body
+                      |> fun st -> SymState.add_path st (sym_expr st_body g)
+                      |> fun st -> SymState.at st t_lbl )
+                    :: ( f_lbl,
+                         st_body
+                         |> fun st -> SymState.add_path st (sym_expr st_body (MicroIR.negate_expr g))
+                         |> fun st -> SymState.at st f_lbl )
+                       :: qs
+                | MicroIR.TSwitch (v, cases, dflt) ->
+                    let v_s = sym_value st_body v in
+                    let case_q =
+                      List.map
+                        (fun (n, lbl) ->
+                          ( lbl,
+                            st_body
+                            |> fun st -> SymState.add_path st (Printf.sprintf "(%s eq %d)" v_s n)
+                            |> fun st -> SymState.at st lbl ))
+                        cases
+                    in
+                    (dflt, SymState.at st_body dflt) :: case_q @ qs
+                | MicroIR.TReturn _ | MicroIR.TStop -> qs
               in
               work next_q visited' acc'
   in
