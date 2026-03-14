@@ -132,11 +132,16 @@ let memory_obligations (ls : LoopSummary.t) (pat : MemoryPattern.t option) =
 let loop_vcs ?pattern (ls : LoopSummary.t) (inv : InvariantGen.t) =
   let inv_facts = formal_facts inv in
   let inv_c = conjunction inv_facts in
-  let tr_c =
+  let tr_eqs =
     ls.LoopSummary.transitions
     |> List.map (fun tr -> tr.LoopSummary.var ^ "' = " ^ tr.after)
-    |> conjunction
   in
+  let synthetic_eqs =
+    ls.LoopSummary.recurrence_hints
+    |> List.filter (fun s -> has_phrase s "' = ")
+    |> List.filter (fun s -> not (List.mem s tr_eqs))
+  in
+  let tr_c = conjunction (tr_eqs @ synthetic_eqs) in
   let obligations =
     [
       mk

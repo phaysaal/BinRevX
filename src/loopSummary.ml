@@ -112,6 +112,15 @@ let guard_lhs guard =
   | lhs :: _ -> Some lhs
   | _ -> None
 
+let synthetic_induction_hints guard transitions =
+  match guard_lhs guard with
+  | Some lhs when starts_with lhs "local_" ->
+      if List.exists (fun (tr : transition) -> tr.var = lhs) transitions then
+        []
+      else
+        [ Printf.sprintf "%s' = %s + 1" lhs lhs ]
+  | _ -> []
+
 let detect_roles guard transitions folded_mirrors =
   let induction =
     transitions
@@ -137,6 +146,23 @@ let detect_roles guard transitions folded_mirrors =
     |> sort_uniq
   in
   (induction, accum)
+
+let ensure_induction_transitions guard transitions =
+  match guard_lhs guard with
+  | Some lhs when starts_with lhs "local_" ->
+      if List.exists (fun (tr : transition) -> tr.var = lhs) transitions then
+        transitions
+      else
+        transitions
+        @
+        [
+          {
+            var = lhs;
+            before = lhs;
+            after = "(" ^ lhs ^ " add 1)";
+          };
+        ]
+  | _ -> transitions
 
 let interesting_extra_vars header_state body_state aliases =
   let alias_sources = List.map snd aliases in
@@ -255,19 +281,22 @@ let summarize fn header_state (lp : LoopRecovery.loop_desc) =
            | Some src -> List.exists (fun tr2 -> tr2.var = src) transitions
            | None -> true)
   in
+  let provisional_guard =
+    match lp.LoopRecovery.guard with
+    | Some g -> SymExec.sym_expr header_state g |> normalize_text alias_subs
+    | None -> "loop_guard_unknown"
+  in
+  let transitions = ensure_induction_transitions provisional_guard transitions in
   let hints =
     transitions
     |> List.filter_map classify_recurrence
+    |> fun xs -> xs @ synthetic_induction_hints provisional_guard transitions
     |> sort_uniq
   in
   let folded_mirrors =
     aliases |> List.sort_uniq compare
   in
-  let guard_rendered =
-    match lp.LoopRecovery.guard with
-    | Some g -> SymExec.sym_expr header_state g |> normalize_text alias_subs
-    | None -> "loop_guard_unknown"
-  in
+  let guard_rendered = provisional_guard in
   let induction_vars, accumulators = detect_roles guard_rendered transitions folded_mirrors in
   {
     header = lp.LoopRecovery.header;
