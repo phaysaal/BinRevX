@@ -170,7 +170,11 @@ let normalize_int_token tok =
 let parse_int_opt tok =
   let tok = normalize_int_token tok in
   try
-    if String.length tok > 2 && String.sub tok 0 2 = "0x" then
+    if String.length tok > 3 && String.sub tok 0 3 = "-0x" then
+      Some (-int_of_string ("0x" ^ String.sub tok 3 (String.length tok - 3)))
+    else if String.length tok > 3 && String.sub tok 0 3 = "+0x" then
+      Some (int_of_string ("0x" ^ String.sub tok 3 (String.length tok - 3)))
+    else if String.length tok > 2 && String.sub tok 0 2 = "0x" then
       Some (int_of_string tok)
     else
       Some (int_of_string tok)
@@ -219,6 +223,18 @@ let x86_frame_stack_offset frame_reg tok =
   else
     None
 
+let canonical_x86_32_reg = function
+  | "eax" | "ax" | "ah" | "al" -> Some "eax"
+  | "ebx" | "bx" | "bh" | "bl" -> Some "ebx"
+  | "ecx" | "cx" | "ch" | "cl" -> Some "ecx"
+  | "edx" | "dx" | "dh" | "dl" -> Some "edx"
+  | "esi" | "si" -> Some "esi"
+  | "edi" | "di" -> Some "edi"
+  | "ebp" | "bp" -> Some "ebp"
+  | "esp" | "sp" -> Some "esp"
+  | "eip" | "ip" -> Some "eip"
+  | _ -> None
+
 let canonical_x86_64_reg = function
   | "rax" | "eax" -> Some "rax"
   | "rbx" | "ebx" -> Some "rbx"
@@ -238,12 +254,21 @@ let canonical_x86_64_reg = function
   | "r15" | "r15d" -> Some "r15"
   | _ -> None
 
+let canonical_arm_reg tok =
+  match tok with
+  | "r0" | "r1" | "r2" | "r3" | "r4" | "r5" | "r6" | "r7" | "r8" | "r9"
+  | "r10" | "r11" | "r12" | "sp" | "lr" | "pc" ->
+      Some tok
+  | "fp" -> Some "r11"
+  | "ip" -> Some "r12"
+  | _ -> None
+
 let canonical_reg abi tok =
   let tok = String.lowercase_ascii (normalize_int_token tok) in
   match abi with
-  | X86_32 -> Some tok
+  | X86_32 -> canonical_x86_32_reg tok
   | X86_64 -> canonical_x86_64_reg tok
-  | ARM_32 -> Some tok
+  | ARM_32 -> canonical_arm_reg tok
 
 let abi_param_regs = function
   | X86_32 -> []
@@ -289,6 +314,12 @@ let frame_stack_offset abi tok =
   | Some reg -> x86_frame_stack_offset reg tok
   | None -> None
 
+let extract_symbol_name tok =
+  match String.index_opt tok '<', String.index_opt tok '>' with
+  | Some i, Some j when i + 1 < j ->
+      Some (String.sub tok (i + 1) (j - i - 1) |> String.lowercase_ascii)
+  | _ -> None
+
 let infer_x86_stack_params abi word_size instrs =
   let offsets =
     instrs
@@ -299,6 +330,14 @@ let infer_x86_stack_params abi word_size instrs =
   in
   let params = List.mapi (fun i _ -> Printf.sprintf "arg%d" i) offsets in
   List.combine offsets params
+
+let infer_x86_stack_locals abi instrs =
+  instrs
+  |> List.concat_map (fun i -> i.operands)
+  |> List.filter_map (frame_stack_offset abi)
+  |> List.filter (fun off -> off < 0)
+  |> List.sort_uniq Int.compare
+  |> List.map (fun off -> (off, Printf.sprintf "local_%x" (abs off)))
 
 let defs_of_instr abi i =
   let reg tok =
@@ -360,7 +399,13 @@ let param_aliases abi instrs =
 
 let param_names aliases = List.map snd aliases
 
-let lookup_stack_param abi aliases tok =
+let local_aliases abi instrs =
+  match abi with
+  | X86_32 | X86_64 ->
+      infer_x86_stack_locals abi instrs |> List.map (fun (o, n) -> (`Stack o, n))
+  | ARM_32 -> []
+
+let lookup_stack_alias abi aliases tok =
   match frame_stack_offset abi tok with
   | Some off ->
       aliases
@@ -383,7 +428,7 @@ let value_of_operand abi aliases tok =
   if tok = "" then
     MicroIR.VUndef
   else
-    match lookup_stack_param abi aliases tok with
+    match lookup_stack_alias abi aliases tok with
     | Some name -> MicroIR.VReg name
     | None ->
         if is_memory_operand tok then
@@ -394,13 +439,16 @@ let value_of_operand abi aliases tok =
           | None -> (
               match canonical_reg abi tok with
               | Some r -> MicroIR.VReg r
-              | None -> MicroIR.VReg (sanitize tok))
+              | None -> (
+                  match extract_symbol_name tok with
+                  | Some name -> MicroIR.VReg name
+                  | None -> MicroIR.VReg (sanitize tok)))
 
 let parse_mem_access abi aliases tok =
   let tok = clean_mem_operand tok in
   if is_memory_operand tok then
     let inner = String.sub tok 1 (String.length tok - 2) in
-    match lookup_stack_param abi aliases tok with
+    match lookup_stack_alias abi aliases tok with
     | Some name -> MicroIR.VReg name
     | None -> (
         match canonical_reg abi inner with
@@ -408,6 +456,11 @@ let parse_mem_access abi aliases tok =
         | None -> MicroIR.VReg (sanitize inner))
   else
     value_of_operand abi aliases tok
+
+let callee_value abi aliases tok =
+  match extract_symbol_name tok with
+  | Some name -> MicroIR.VReg name
+  | None -> value_of_operand abi aliases tok
 
 let jcc_pred = function
   | "je" | "jz" | "beq" -> Some "eq"
@@ -496,8 +549,8 @@ let is_stack_setup abi = function
       | None -> false)
   | _ -> false
 
-let initial_param_moves abi aliases =
-  aliases
+let initial_param_moves abi param_aliases =
+  param_aliases
   |> List.filter_map (function
        | `Reg reg, name ->
            Some (MicroIR.IAssign (reg, MicroIR.EVal (MicroIR.VReg name)))
@@ -520,7 +573,7 @@ let translate_block_body abi aliases insns =
               | X86_64 | ARM_32 -> call_args_from_regs ()
             in
             let ins =
-              MicroIR.ICall (abi_return_reg abi, value_of_operand abi aliases callee, args)
+              MicroIR.ICall (abi_return_reg abi, callee_value abi aliases callee, args)
             in
             loop [] (ins :: acc) rest
         | "mov", [ dst; src ] ->
@@ -594,7 +647,7 @@ let translate_block_body abi aliases insns =
   in
   loop [] [] insns
 
-let build_blocks abi fname params ret aliases instrs =
+let build_blocks abi fname params ret param_aliases aliases instrs =
   match instrs with
   | [] -> raise (Import_error ("no disassembly for function " ^ fname))
   | _ ->
@@ -677,7 +730,10 @@ let build_blocks abi fname params ret aliases instrs =
           insns |> List.rev |> List.tl |> List.rev |> translate_block_body abi aliases
         in
         let body =
-          if label = entry_label then initial_param_moves abi aliases @ body_core else body_core
+          if label = entry_label then
+            initial_param_moves abi param_aliases @ body_core
+          else
+            body_core
         in
         let last = List.hd (List.rev insns) in
         let term =
@@ -722,6 +778,7 @@ let import ?(func = "main") path =
   else
     let abi = detect_abi path in
     let instrs = disassemble_function abi path func in
-    let aliases = param_aliases abi instrs in
-    let params = param_names aliases in
-    [ build_blocks abi func params (abi_return_reg abi) aliases instrs ]
+    let params_aliases = param_aliases abi instrs in
+    let aliases = params_aliases @ local_aliases abi instrs in
+    let params = param_names params_aliases in
+    [ build_blocks abi func params (abi_return_reg abi) params_aliases aliases instrs ]
