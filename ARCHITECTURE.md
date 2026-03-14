@@ -19,6 +19,10 @@ Instead use:
 
 `binary -> lifted CFG -> SSA-like MicroIR -> structural recovery -> summaries -> symbolic execution`
 
+Related note:
+
+- `architecture/DEMAND_DRIVEN_INTERPROC.md` describes the demand-driven interprocedural strategy for reachable-function lifting and analysis.
+
 ## 2. Instruction-Set Challenge
 
 The instruction-set problem is real. Raw symbolic execution over assembly is expensive because:

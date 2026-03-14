@@ -17,6 +17,7 @@ let print_reasoning () =
   print_endline ""
 
 let binary_func = ref "main"
+let demand_mode = ref false
 
 let is_elf_file path =
   let ic = open_in_bin path in
@@ -34,6 +35,9 @@ let load_prog () =
     | [] -> path
     | "--func" :: name :: rest ->
         binary_func := name;
+        parse path rest
+    | "--demand" :: rest ->
+        demand_mode := true;
         parse path rest
     | arg :: rest ->
         if path = None then
@@ -190,17 +194,24 @@ let () =
   print_header ();
   print_pipeline ();
   print_reasoning ();
-  Printf.printf "Recovered loops from %s:\n" source;
-  List.iter
-    (fun fn ->
-      print_func_loops fn;
-      print_func_regions fn;
-      print_endline "  summary:";
-      print_func_summary fn;
-      print_func_symbolic fn;
-      print_loop_summaries fn;
-      print_memory_patterns fn;
-      print_loop_invariants fn;
-      print_loop_vcs fn;
-      print_endline "")
-    prog
+  if !demand_mode && String.ends_with ~suffix:(" [func=" ^ !binary_func ^ "]") source then
+    let suffix = " [func=" ^ !binary_func ^ "]" in
+    let path = String.sub source 0 (String.length source - String.length suffix) in
+    let analysis = DemandInterproc.analyze_binary ~path ~entry:!binary_func () in
+    print_endline (DemandInterproc.render analysis)
+  else begin
+    Printf.printf "Recovered loops from %s:\n" source;
+    List.iter
+      (fun fn ->
+        print_func_loops fn;
+        print_func_regions fn;
+        print_endline "  summary:";
+        print_func_summary fn;
+        print_func_symbolic fn;
+        print_loop_summaries fn;
+        print_memory_patterns fn;
+        print_loop_invariants fn;
+        print_loop_vcs fn;
+        print_endline "")
+      prog
+  end
