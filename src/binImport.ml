@@ -32,6 +32,11 @@ type resolver = {
 
 let current_resolver : resolver option ref = ref None
 
+type alias_key =
+  [ `Stack of int
+  | `Reg of string
+  | `RegDisp of string * int ]
+
 let trim = String.trim
 
 let split_words s =
@@ -513,6 +518,30 @@ let frame_stack_offset abi tok =
   | Some reg -> x86_frame_stack_offset reg tok
   | None -> None
 
+let reg_disp_offset abi tok =
+  let tok = clean_mem_operand tok in
+  if String.length tok >= 3 && tok.[0] = '[' && tok.[String.length tok - 1] = ']'
+  then
+    let inner = String.sub tok 1 (String.length tok - 2) |> trim in
+    let try_prefix sign =
+      let mark = if sign > 0 then "+" else "-" in
+      match String.index_opt inner mark.[0] with
+      | Some i ->
+          let lhs = String.sub inner 0 i |> trim in
+          let rhs = String.sub inner (i + 1) (String.length inner - i - 1) |> trim in
+          begin
+            match canonical_reg abi lhs, parse_int_opt ((if sign < 0 then "-" else "") ^ rhs) with
+            | Some reg, Some off -> Some (reg, off)
+            | _ -> None
+          end
+      | None -> None
+    in
+    match try_prefix 1 with
+    | Some x -> Some x
+    | None -> try_prefix (-1)
+  else
+    None
+
 let extract_symbol_name tok =
   match String.index_opt tok '<', String.index_opt tok '>' with
   | Some i, Some j when i + 1 < j ->
@@ -591,20 +620,43 @@ let infer_register_params abi instrs =
   |> List.filter (fun r -> SS.mem r !used_params)
   |> List.mapi (fun i r -> (r, Printf.sprintf "arg%d" i))
 
-let param_aliases abi instrs =
+let infer_x86_entry_params abi instrs : (alias_key * string) list =
+  let ecx_entry =
+    instrs
+    |> List.exists (fun i ->
+           match i.mnemonic, i.operands with
+           | "lea", [ dst; src ] ->
+               canonical_reg abi dst = Some "ecx"
+               &&
+               (match clean_mem_operand src with
+                | "[esp+0x4]" | "[esp+4]" -> true
+                | _ -> false)
+           | "lea", _ -> false
+           | _ -> false)
+  in
+  if abi = X86_32 && ecx_entry then
+    [ (`RegDisp ("ecx", 0), "arg0"); (`RegDisp ("ecx", 4), "arg1"); (`RegDisp ("ecx", 8), "arg2") ]
+  else
+    []
+
+let param_aliases abi instrs : (alias_key * string) list =
   match abi with
-  | X86_32 -> infer_x86_stack_params abi 4 instrs |> List.map (fun (o, n) -> (`Stack o, n))
-  | X86_64 | ARM_32 -> infer_register_params abi instrs |> List.map (fun (r, n) -> (`Reg r, n))
+  | X86_32 ->
+      let stack_params = infer_x86_stack_params abi 4 instrs |> List.map (fun (o, n) -> ((`Stack o : alias_key), n)) in
+      let entry_params = infer_x86_entry_params abi instrs in
+      if entry_params <> [] then entry_params else stack_params
+  | X86_64 | ARM_32 ->
+      infer_register_params abi instrs |> List.map (fun (r, n) -> ((`Reg r : alias_key), n))
 
-let param_names aliases = List.map snd aliases
+let param_names (aliases : (alias_key * string) list) = List.map snd aliases
 
-let local_aliases abi instrs =
+let local_aliases abi instrs : (alias_key * string) list =
   match abi with
   | X86_32 | X86_64 ->
-      infer_x86_stack_locals abi instrs |> List.map (fun (o, n) -> (`Stack o, n))
+      infer_x86_stack_locals abi instrs |> List.map (fun (o, n) -> ((`Stack o : alias_key), n))
   | ARM_32 -> []
 
-let lookup_stack_alias abi aliases tok =
+let lookup_stack_alias abi (aliases : (alias_key * string) list) tok =
   match frame_stack_offset abi tok with
   | Some off ->
       aliases
@@ -613,7 +665,16 @@ let lookup_stack_alias abi aliases tok =
            | _ -> None)
   | None -> None
 
-let lookup_reg_param abi aliases tok =
+let lookup_reg_disp_alias abi (aliases : (alias_key * string) list) tok =
+  match reg_disp_offset abi tok with
+  | Some (reg, off) ->
+      aliases
+      |> List.find_map (function
+           | `RegDisp (r, k), name when r = reg && k = off -> Some name
+           | _ -> None)
+  | None -> None
+
+let lookup_reg_param abi (aliases : (alias_key * string) list) tok =
   match canonical_reg abi tok with
   | Some reg ->
       aliases
@@ -622,7 +683,7 @@ let lookup_reg_param abi aliases tok =
            | _ -> None)
   | None -> None
 
-let value_of_operand abi aliases tok =
+let value_of_operand abi (aliases : (alias_key * string) list) tok =
   let tok = trim tok |> clean_mem_operand in
   if tok = "" then
     MicroIR.VUndef
@@ -633,7 +694,10 @@ let value_of_operand abi aliases tok =
         begin
           match lookup_stack_alias abi aliases tok with
           | Some name -> MicroIR.VReg name
-          | None ->
+          | None -> (
+              match lookup_reg_disp_alias abi aliases tok with
+              | Some name -> MicroIR.VReg name
+              | None ->
               if is_memory_operand tok then
                 MicroIR.VReg ("mem_" ^ sanitize tok)
               else
@@ -652,9 +716,10 @@ let value_of_operand abi aliases tok =
                             end
                       end
                 end
+              )
         end
 
-let parse_mem_access abi aliases tok =
+let parse_mem_access abi (aliases : (alias_key * string) list) tok =
   let tok = clean_mem_operand tok in
   match resolve_pic_symbol tok with
   | Some name -> MicroIR.VReg name
@@ -664,16 +729,19 @@ let parse_mem_access abi aliases tok =
         match lookup_stack_alias abi aliases tok with
         | Some name -> MicroIR.VReg name
         | None -> (
-            match canonical_reg abi inner with
-            | Some r -> MicroIR.VReg r
-            | None -> MicroIR.VReg (sanitize inner))
+            match lookup_reg_disp_alias abi aliases tok with
+            | Some name -> MicroIR.VReg name
+            | None -> (
+                match canonical_reg abi inner with
+                | Some r -> MicroIR.VReg r
+                | None -> MicroIR.VReg (sanitize inner)))
       else
         value_of_operand abi aliases tok
 
-let stack_alias_of_operand abi aliases tok =
+let stack_alias_of_operand abi (aliases : (alias_key * string) list) tok =
   lookup_stack_alias abi aliases (clean_mem_operand tok)
 
-let callee_value abi aliases tok =
+let callee_value abi (aliases : (alias_key * string) list) tok =
   match extract_symbol_name tok with
   | Some name -> MicroIR.VReg name
   | None -> value_of_operand abi aliases tok
@@ -765,14 +833,14 @@ let is_stack_setup abi = function
       | None -> false)
   | _ -> false
 
-let initial_param_moves abi param_aliases =
+let initial_param_moves abi (param_aliases : (alias_key * string) list) =
   param_aliases
   |> List.filter_map (function
        | `Reg reg, name ->
            Some (MicroIR.IAssign (reg, MicroIR.EVal (MicroIR.VReg name)))
-       | `Stack _, _ -> None)
+       | `Stack _, _ | `RegDisp (_, _), _ -> None)
 
-let translate_block_body abi aliases insns =
+let translate_block_body abi (aliases : (alias_key * string) list) insns =
   let call_args_from_regs () =
     abi_param_regs abi |> List.map (fun r -> MicroIR.VReg r)
   in
@@ -885,7 +953,7 @@ let translate_block_body abi aliases insns =
   in
   loop [] [] insns
 
-let build_blocks abi fname params ret param_aliases aliases instrs =
+let build_blocks abi fname params ret (param_aliases : (alias_key * string) list) (aliases : (alias_key * string) list) instrs =
   match instrs with
   | [] -> raise (Import_error ("no disassembly for function " ^ fname))
   | _ ->
@@ -1132,6 +1200,65 @@ let normalize_arg_spills abi (fn : MicroIR.func) =
       blocks;
     }
 
+let rename_value_vars ren = function
+  | MicroIR.VReg v -> MicroIR.VReg (Option.value (List.assoc_opt v ren) ~default:v)
+  | v -> v
+
+let rename_expr_vars ren = function
+  | MicroIR.EVal v -> MicroIR.EVal (rename_value_vars ren v)
+  | MicroIR.EBinop (op, a, b) -> MicroIR.EBinop (op, rename_value_vars ren a, rename_value_vars ren b)
+  | MicroIR.ELoad v -> MicroIR.ELoad (rename_value_vars ren v)
+  | MicroIR.EAddr (v, off) -> MicroIR.EAddr (rename_value_vars ren v, off)
+  | MicroIR.EIndex (base, idx, width) ->
+      MicroIR.EIndex (rename_value_vars ren base, rename_value_vars ren idx, width)
+  | MicroIR.EField (base, fld) -> MicroIR.EField (rename_value_vars ren base, fld)
+  | MicroIR.ECmp (pred, a, b) -> MicroIR.ECmp (pred, rename_value_vars ren a, rename_value_vars ren b)
+
+let rename_instr_vars ren = function
+  | MicroIR.IAssign (dst, e) ->
+      MicroIR.IAssign (Option.value (List.assoc_opt dst ren) ~default:dst, rename_expr_vars ren e)
+  | MicroIR.IStore (a, b) -> MicroIR.IStore (rename_value_vars ren a, rename_value_vars ren b)
+  | MicroIR.IAssume e -> MicroIR.IAssume (rename_expr_vars ren e)
+  | MicroIR.IAssert e -> MicroIR.IAssert (rename_expr_vars ren e)
+  | MicroIR.ICall (ret, callee, args) ->
+      MicroIR.ICall
+        (Option.map (fun v -> Option.value (List.assoc_opt v ren) ~default:v) ret,
+         rename_value_vars ren callee,
+         List.map (rename_value_vars ren) args)
+
+let rename_term_vars ren = function
+  | MicroIR.TJump _ as t -> t
+  | MicroIR.TStop as t -> t
+  | MicroIR.TBranch (e, t, f) -> MicroIR.TBranch (rename_expr_vars ren e, t, f)
+  | MicroIR.TSwitch (v, cases, dflt) -> MicroIR.TSwitch (rename_value_vars ren v, cases, dflt)
+  | MicroIR.TReturn v -> MicroIR.TReturn (Option.map (rename_value_vars ren) v)
+
+let normalize_entry_slot_aliases (fn : MicroIR.func) =
+  let ren =
+    match fn.MicroIR.params with
+    | [ "arg0"; "arg1"; "arg2" ] ->
+        [ ("ecx_0x4", "arg1"); ("ecx_0x8", "arg2") ]
+    | [ "arg0"; "arg1" ] ->
+        [ ("ecx_0x4", "arg1") ]
+    | _ -> []
+  in
+  if ren = [] then
+    fn
+  else
+    {
+      fn with
+      MicroIR.ret =
+        Option.map (fun r -> Option.value (List.assoc_opt r ren) ~default:r) fn.MicroIR.ret;
+      blocks =
+        fn.MicroIR.blocks
+        |> List.map (fun blk ->
+               {
+                 blk with
+                 MicroIR.body = List.map (rename_instr_vars ren) blk.MicroIR.body;
+                 term = rename_term_vars ren blk.MicroIR.term;
+               });
+    }
+
 let import ?(func = "main") path =
   let funcs = defined_functions path in
   if not (List.mem func funcs) then
@@ -1150,9 +1277,15 @@ let import ?(func = "main") path =
     let instrs = disassemble_function abi path func in
     current_resolver := Some (build_resolver abi path instrs);
     let params_aliases = param_aliases abi instrs in
-    let aliases = params_aliases @ local_aliases abi instrs in
-    let params = param_names params_aliases in
+    let entry_aliases = infer_x86_entry_params abi instrs in
+    let aliases = params_aliases @ entry_aliases @ local_aliases abi instrs in
+    let params =
+      match param_names params_aliases with
+      | [] -> param_names entry_aliases
+      | xs -> xs
+    in
     [
       build_blocks abi func params (abi_return_reg abi) params_aliases aliases instrs
-      |> normalize_arg_spills abi;
+      |> normalize_arg_spills abi
+      |> normalize_entry_slot_aliases
     ]

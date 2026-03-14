@@ -25,6 +25,14 @@ let of_inputs inputs =
 
 let render_env env =
   SM.bindings env
+  |> List.filter (fun (k, _) ->
+         not
+           (String.starts_with ~prefix:"ecx_0x" k
+           || String.starts_with ~prefix:"edx_0x" k
+           || String.starts_with ~prefix:"eax_0x" k
+           || String.starts_with ~prefix:"ebx_0x" k
+           || String.starts_with ~prefix:"esp_0x" k
+           || String.starts_with ~prefix:"rsp_0x" k))
   |> List.map (fun (k, v) -> k ^ "=" ^ v)
   |> String.concat ","
 
