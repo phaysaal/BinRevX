@@ -10,6 +10,26 @@ type summary = {
 
 let sort_uniq xs = List.sort_uniq String.compare xs
 
+let starts_with s prefix =
+  let ns = String.length s in
+  let np = String.length prefix in
+  ns >= np && String.sub s 0 np = prefix
+
+let summary_noise v =
+  v = "esp" || v = "rsp" || v = "ebp" || v = "rbp" || v = "sp" || v = "fp"
+  || v = "rdi" || v = "rsi" || v = "rdx" || v = "rcx" || v = "r8" || v = "r9"
+  || v = "r0" || v = "r1" || v = "r2" || v = "r3"
+  || v = "flag"
+  || starts_with v "esp_"
+  || starts_with v "rsp_"
+  || starts_with v "ebp_"
+  || starts_with v "rbp_"
+  || starts_with v "gs_"
+  || starts_with v "__x86.get_pc_thunk."
+
+let sanitize_summary_vars xs =
+  xs |> List.filter (fun v -> not (summary_noise v)) |> sort_uniq
+
 let used_value = function
   | MicroIR.VReg v -> [ v ]
   | MicroIR.VConst _ | MicroIR.VUndef -> []
@@ -206,16 +226,19 @@ let infer (fn : MicroIR.func) =
   {
     fname = fn.MicroIR.fname;
     params;
-    pre = ambient_inputs;
+    pre = sanitize_summary_vars ambient_inputs;
     post =
       ((if loops = [] then [] else [ "loops=" ^ string_of_int (List.length loops) ])
       @
       match returns with
       | Some r -> [ "ret=" ^ r ]
       | None -> []);
-    modifies = sort_uniq !modifies;
+    modifies =
+      !modifies
+      |> List.filter (fun v -> not (List.mem v params))
+      |> sanitize_summary_vars;
     returns;
-    calls = sort_uniq !calls;
+    calls = sanitize_summary_vars !calls;
   }
 
 let render s =
