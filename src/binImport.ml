@@ -457,6 +457,9 @@ let parse_mem_access abi aliases tok =
   else
     value_of_operand abi aliases tok
 
+let stack_alias_of_operand abi aliases tok =
+  lookup_stack_alias abi aliases (clean_mem_operand tok)
+
 let callee_value abi aliases tok =
   match extract_symbol_name tok with
   | Some name -> MicroIR.VReg name
@@ -579,16 +582,24 @@ let translate_block_body abi aliases insns =
         | "mov", [ dst; src ] ->
             let ins =
               if is_memory_operand dst then
-                Some
-                  (MicroIR.IStore
-                     (parse_mem_access abi aliases dst, value_of_operand abi aliases src))
+                (match stack_alias_of_operand abi aliases dst with
+                | Some alias ->
+                    Some
+                      (MicroIR.IAssign
+                         (alias, MicroIR.EVal (value_of_operand abi aliases src)))
+                | None ->
+                    Some
+                      (MicroIR.IStore
+                         (parse_mem_access abi aliases dst, value_of_operand abi aliases src)))
               else if is_memory_operand src then
                 Some
                   (MicroIR.IAssign
                      ( Option.value
                          (canonical_reg abi dst)
                          ~default:(sanitize dst),
-                       MicroIR.ELoad (parse_mem_access abi aliases src) ))
+                       match stack_alias_of_operand abi aliases src with
+                       | Some alias -> MicroIR.EVal (MicroIR.VReg alias)
+                       | None -> MicroIR.ELoad (parse_mem_access abi aliases src) ))
               else
                 Some
                   (MicroIR.IAssign
@@ -609,17 +620,31 @@ let translate_block_body abi aliases insns =
             let ins =
               MicroIR.IAssign
                 ( Option.value (canonical_reg abi dst) ~default:(sanitize dst),
-                  MicroIR.ELoad (parse_mem_access abi aliases src) )
+                  match stack_alias_of_operand abi aliases src with
+                  | Some alias -> MicroIR.EVal (MicroIR.VReg alias)
+                  | None -> MicroIR.ELoad (parse_mem_access abi aliases src) )
             in
             loop [] (ins :: acc) rest
         | "str", [ src; dst ] ->
             let ins =
-              MicroIR.IStore
-                (parse_mem_access abi aliases dst, value_of_operand abi aliases src)
+              match stack_alias_of_operand abi aliases dst with
+              | Some alias ->
+                  MicroIR.IAssign
+                    (alias, MicroIR.EVal (value_of_operand abi aliases src))
+              | None ->
+                  MicroIR.IStore
+                    (parse_mem_access abi aliases dst, value_of_operand abi aliases src)
             in
             loop [] (ins :: acc) rest
         | ("add" | "sub" | "and" as op), [ dst; src ] ->
-            let dstv = Option.value (canonical_reg abi dst) ~default:(sanitize dst) in
+            let dstv =
+              match canonical_reg abi dst with
+              | Some r -> r
+              | None -> (
+                  match stack_alias_of_operand abi aliases dst with
+                  | Some alias -> alias
+                  | None -> sanitize dst)
+            in
             let ins =
               MicroIR.IAssign
                 (dstv, MicroIR.EBinop (op, MicroIR.VReg dstv, value_of_operand abi aliases src))
