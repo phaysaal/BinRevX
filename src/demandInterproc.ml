@@ -1,6 +1,11 @@
 module SM = Map.Make (String)
 module SS = Set.Make (String)
 
+type call_class =
+  | DescendInternal
+  | StubInternal
+  | StubExternal
+
 type call_site = {
   caller : string;
   block : string;
@@ -9,7 +14,7 @@ type call_site = {
   args : string list;
   ret_dst : string option;
   state : SymState.t;
-  internal : bool;
+  class_ : call_class;
 }
 
 type func_result = {
@@ -36,6 +41,21 @@ let is_internal_name env name =
   && not (String.contains name '@')
   && not (String.ends_with ~suffix:"_plt" name)
 
+let is_driver_local_name name =
+  name = "main"
+  || name = "tester_main"
+  || name = "warmup"
+  || String.ends_with ~suffix:"_tester" name
+  || String.starts_with ~prefix:"__x86.get_pc_thunk." name
+
+let classify_call env ~entry ~caller callee =
+  if not (is_internal_name env callee) then
+    StubExternal
+  else if callee = entry || callee = caller || is_driver_local_name callee then
+    DescendInternal
+  else
+    StubInternal
+
 let import_func env fname =
   match BinImport.import ~func:fname env.path with
   | [ fn ] -> fn
@@ -61,7 +81,7 @@ let callee_seed fn summary args state =
   in
   { st with SymState.mem = state.SymState.mem; location = fn.MicroIR.entry }
 
-let walk_function env fn seed ~on_call =
+let walk_function env ~entry fn seed ~on_call =
   let blocks = CfgAnalysis.block_map fn in
   let visited = ref SS.empty in
   let rec traverse lbl st =
@@ -81,7 +101,7 @@ let walk_function env fn seed ~on_call =
       | MicroIR.ICall (ret, MicroIR.VReg callee, args) as ins ->
           let call_state = SymState.at st blk.MicroIR.label in
           let arg_values = List.map (SymExec.sym_value st) args in
-          let internal = is_internal_name env callee in
+          let class_ = classify_call env ~entry ~caller:fn.MicroIR.fname callee in
           on_call
             {
               caller = fn.MicroIR.fname;
@@ -91,7 +111,7 @@ let walk_function env fn seed ~on_call =
               args = arg_values;
               ret_dst = ret;
               state = call_state;
-              internal;
+              class_;
             };
           exec_instrs blk (idx + 1) (SymExec.exec_instr st ins)
       | ins ->
@@ -151,9 +171,9 @@ let analyze_binary ?(max_functions = 32) ~path ~entry () =
         | None -> SymState.at (SymExec.from_summary summary) fn.MicroIR.entry
       in
       let call_sites = ref [] in
-      walk_function env fn entry_state ~on_call:(fun cs ->
+      walk_function env ~entry fn entry_state ~on_call:(fun cs ->
           call_sites := cs :: !call_sites;
-          if cs.internal then begin
+          if cs.class_ = DescendInternal then begin
             let callee_fn = import_func env cs.callee in
             let callee_summary = ModSummary.infer callee_fn in
             let callee_state = callee_seed callee_fn callee_summary cs.args cs.state in
@@ -175,10 +195,15 @@ let analyze_binary ?(max_functions = 32) ~path ~entry () =
   ensure entry;
   { entry; order = !order; results = !results; truncated = !truncated }
 
+let string_of_class = function
+  | DescendInternal -> "descend-internal"
+  | StubInternal -> "stub-internal"
+  | StubExternal -> "stub-external"
+
 let render_call_site cs =
   Printf.sprintf
-    "callsite(block=%s, idx=%d, callee=%s, internal=%b, ret=%s, args=[%s], state=%s)"
-    cs.block cs.instr_index cs.callee cs.internal
+    "callsite(block=%s, idx=%d, callee=%s, class=%s, ret=%s, args=[%s], state=%s)"
+    cs.block cs.instr_index cs.callee (string_of_class cs.class_)
     (match cs.ret_dst with Some r -> r | None -> "void")
     (String.concat ", " cs.args)
     (SymState.render cs.state)

@@ -150,6 +150,7 @@ The system needs stub summaries for:
 The first implementation inside `BinRevX` is intentionally narrower:
 
 - direct internal calls only
+- descent firewall for likely driver-local functions only
 - DFS over reachable internal functions
 - saved call-site state and resume metadata
 - summary reuse by function name
