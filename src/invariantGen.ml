@@ -113,12 +113,28 @@ let memory_pattern_facts (pat : MemoryPattern.t option) =
       | MemoryPattern.UnknownLoop -> [])
       |> List.filter_map (fun x -> x)
 
+let role_facts (ls : LoopSummary.t) =
+  let induction =
+    ls.LoopSummary.induction_vars
+    |> List.map (fun v -> v ^ " is the induction variable")
+  in
+  let accum =
+    ls.LoopSummary.accumulators
+    |> List.map (fun v -> v ^ " is an accumulator")
+  in
+  let folded =
+    ls.LoopSummary.folded_mirrors
+    |> List.map (fun (a, b) -> a ^ " is a temporary mirror of " ^ b)
+  in
+  induction @ accum @ folded
+
 let generate ?pattern (ls : LoopSummary.t) =
   let facts =
     facts_from_guard ls
     @ List.concat_map facts_from_transition ls.transitions
     @ imply_nonneg ls
     @ memory_pattern_facts pattern
+    @ role_facts ls
     |> sort_uniq
   in
   { header = ls.header; facts }

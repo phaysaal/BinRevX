@@ -80,6 +80,20 @@ let header_uses blk =
   in
   List.concat_map used_of_instr blk.MicroIR.body @ term_uses
 
+let header_alias_sources blk =
+  let term_uses =
+    match blk.MicroIR.term with
+    | MicroIR.TBranch (e, _, _) -> used_expr e
+    | MicroIR.TSwitch (v, _, _) -> used_value v
+    | _ -> []
+  in
+  blk.MicroIR.body
+  |> List.filter_map (function
+       | MicroIR.IAssign (dst, MicroIR.EVal (MicroIR.VReg src))
+         when List.mem dst term_uses ->
+           Some src
+       | _ -> None)
+
 let self_referential_defs blk =
   blk.MicroIR.body
   |> List.filter_map (function
@@ -103,6 +117,7 @@ let carried_vars fn header body_nodes =
   let self_defs = ref [] in
   let mem_uses = ref [] in
   let header_used = ref [] in
+  let header_alias = ref [] in
   List.iter
     (fun blk ->
       if CfgAnalysis.SS.mem blk.MicroIR.label node_set then begin
@@ -115,14 +130,17 @@ let carried_vars fn header body_nodes =
         mem_uses := !mem_uses @ memory_cursor_uses blk
       end;
       if blk.MicroIR.label = header then
-        header_used := !header_used @ header_uses blk)
+        begin
+          header_used := !header_used @ header_uses blk;
+          header_alias := !header_alias @ header_alias_sources blk
+        end)
     fn.MicroIR.blocks;
   let defset = List.fold_left (fun acc v -> CfgAnalysis.SS.add v acc) CfgAnalysis.SS.empty !defs in
   let classical =
     !uses |> sort_uniq |> List.filter (fun v -> CfgAnalysis.SS.mem v defset)
   in
   let structural =
-    (!self_defs @ !mem_uses @ !header_used)
+    (!self_defs @ !mem_uses @ !header_used @ !header_alias)
     |> sort_uniq
     |> List.filter (fun v -> CfgAnalysis.SS.mem v defset)
   in
