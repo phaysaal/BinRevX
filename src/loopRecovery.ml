@@ -71,20 +71,62 @@ let used_of_instr = function
   | MicroIR.IAssume e | MicroIR.IAssert e -> used_expr e
   | MicroIR.ICall (_, callee, args) -> used_value callee @ List.flatten (List.map used_value args)
 
-let carried_vars fn body_nodes =
+let header_uses blk =
+  let term_uses =
+    match blk.MicroIR.term with
+    | MicroIR.TBranch (e, _, _) -> used_expr e
+    | MicroIR.TSwitch (v, _, _) -> used_value v
+    | _ -> []
+  in
+  List.concat_map used_of_instr blk.MicroIR.body @ term_uses
+
+let self_referential_defs blk =
+  blk.MicroIR.body
+  |> List.filter_map (function
+       | MicroIR.IAssign (dst, e) ->
+           if List.mem dst (used_expr e) then Some dst else None
+       | _ -> None)
+
+let memory_cursor_uses blk =
+  blk.MicroIR.body
+  |> List.concat_map (function
+       | MicroIR.IAssign (_, MicroIR.EIndex (base, idx, _)) -> used_value base @ used_value idx
+       | MicroIR.IAssign (_, MicroIR.EField (base, _)) -> used_value base
+       | MicroIR.IAssign (_, MicroIR.ELoad v) -> used_value v
+       | MicroIR.IStore (a, b) -> used_value a @ used_value b
+       | _ -> [])
+
+let carried_vars fn header body_nodes =
   let node_set = List.fold_left (fun acc n -> CfgAnalysis.SS.add n acc) CfgAnalysis.SS.empty body_nodes in
   let defs = ref [] in
   let uses = ref [] in
+  let self_defs = ref [] in
+  let mem_uses = ref [] in
+  let header_used = ref [] in
   List.iter
     (fun blk ->
       if CfgAnalysis.SS.mem blk.MicroIR.label node_set then begin
         List.iter (fun ins ->
           defs := !defs @ defs_of_instr ins;
           uses := !uses @ used_of_instr ins) blk.MicroIR.body
-      end)
+      end;
+      if List.mem blk.MicroIR.label body_nodes then begin
+        self_defs := !self_defs @ self_referential_defs blk;
+        mem_uses := !mem_uses @ memory_cursor_uses blk
+      end;
+      if blk.MicroIR.label = header then
+        header_used := !header_used @ header_uses blk)
     fn.MicroIR.blocks;
   let defset = List.fold_left (fun acc v -> CfgAnalysis.SS.add v acc) CfgAnalysis.SS.empty !defs in
-  !uses |> sort_uniq |> List.filter (fun v -> CfgAnalysis.SS.mem v defset)
+  let classical =
+    !uses |> sort_uniq |> List.filter (fun v -> CfgAnalysis.SS.mem v defset)
+  in
+  let structural =
+    (!self_defs @ !mem_uses @ !header_used)
+    |> sort_uniq
+    |> List.filter (fun v -> CfgAnalysis.SS.mem v defset)
+  in
+  sort_uniq (classical @ structural)
 
 let classify_shape body_nodes =
   match List.length body_nodes with
@@ -113,7 +155,7 @@ let recover_loops (fn : MicroIR.func) =
            header;
            body_nodes;
            exits = CfgAnalysis.exit_nodes fn body_nodes |> sort_uniq;
-           carried = carried_vars fn body_nodes;
+           carried = carried_vars fn header body_nodes;
            shape = classify_shape body_nodes;
            guard;
          })

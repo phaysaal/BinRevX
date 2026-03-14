@@ -16,10 +16,29 @@ let print_reasoning () =
     "  Lift instructions into a canonical MicroIR, then recover loops and summaries.";
   print_endline ""
 
+let is_elf_file path =
+  let ic = open_in_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_in_noerr ic)
+    (fun () ->
+      let b0 = input_byte ic in
+      let b1 = input_byte ic in
+      let b2 = input_byte ic in
+      let b3 = input_byte ic in
+      b0 = 0x7f && b1 = Char.code 'E' && b2 = Char.code 'L' && b3 = Char.code 'F')
+
 let load_prog () =
   match Array.to_list Sys.argv with
   | [ _ ] -> ("built-in sample", MicroIR.sample_prog)
-  | [ _; path ] -> (path, MicroIRParser.load path)
+  | [ _; path ] ->
+      if is_elf_file path then begin
+        prerr_endline
+          ("error: raw ELF binaries are not accepted by BinRevX: " ^ path);
+        prerr_endline
+          "hint: first lift the binary into MicroIR, or use BinRevZ for direct ELF analysis.";
+        exit 2
+      end;
+      (path, MicroIRParser.load path)
   | _ ->
       prerr_endline "usage: ./binrevx [program.microir]";
       exit 2

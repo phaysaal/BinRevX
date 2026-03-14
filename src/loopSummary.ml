@@ -64,6 +64,7 @@ let summarize fn header_state (lp : LoopRecovery.loop_desc) =
              | None -> before
            in
            { var = v; before; after })
+    |> List.filter (fun tr -> tr.after <> tr.before)
   in
   let hints =
     transitions
