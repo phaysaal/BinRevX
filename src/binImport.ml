@@ -37,6 +37,11 @@ let rec take n xs =
   | 0, _ | _, [] -> []
   | n, x :: rest -> x :: take (n - 1) rest
 
+let rec zip xs ys =
+  match xs, ys with
+  | x :: xs, y :: ys -> (x, y) :: zip xs ys
+  | _ -> []
+
 let run_lines cmd =
   let ic = Unix.open_process_in cmd in
   let rec loop acc =
@@ -108,6 +113,11 @@ let contains_sub s sub =
     else loop (i + 1)
   in
   np = 0 || loop 0
+
+let starts_with s prefix =
+  let ns = String.length s in
+  let np = String.length prefix in
+  ns >= np && String.sub s 0 np = prefix
 
 let detect_abi path =
   let lines = run_lines ("readelf -h " ^ Filename.quote path) in
@@ -329,7 +339,7 @@ let infer_x86_stack_params abi word_size instrs =
     |> List.sort_uniq Int.compare
   in
   let params = List.mapi (fun i _ -> Printf.sprintf "arg%d" i) offsets in
-  List.combine offsets params
+  zip offsets params
 
 let infer_x86_stack_locals abi instrs =
   instrs
@@ -787,6 +797,138 @@ let build_blocks abi fname params ret param_aliases aliases instrs =
       let blocks = blocks [] instrs |> List.map mk_block in
       { MicroIR.fname = fname; entry = entry_label; params; ret; blocks }
 
+let defs_of_instr = function
+  | MicroIR.IAssign (dst, _) -> [ dst ]
+  | MicroIR.ICall (Some dst, _, _) -> [ dst ]
+  | _ -> []
+
+let defs_of_func (fn : MicroIR.func) =
+  fn.MicroIR.blocks
+  |> List.concat_map (fun blk -> blk.MicroIR.body |> List.concat_map defs_of_instr)
+
+let arg_spill_aliases abi (fn : MicroIR.func) =
+  let def_counts =
+    defs_of_func fn
+    |> List.sort String.compare
+    |> List.fold_left
+         (fun acc v ->
+           let n = Option.value (CfgAnalysis.SM.find_opt v acc) ~default:0 in
+           CfgAnalysis.SM.add v (n + 1) acc)
+         CfgAnalysis.SM.empty
+  in
+  let entry_blk =
+    fn.MicroIR.blocks
+    |> List.find_opt (fun blk -> blk.MicroIR.label = fn.MicroIR.entry)
+  in
+  match entry_blk with
+  | None -> []
+  | Some blk ->
+      let initial_env =
+        match abi with
+        | X86_32 -> []
+        | X86_64 | ARM_32 ->
+            zip (abi_param_regs abi) fn.MicroIR.params
+      in
+      let rec scan env aliases = function
+        | [] -> aliases
+        | MicroIR.IAssign (dst, MicroIR.EVal (MicroIR.VReg src)) :: rest ->
+            let src' = Option.value (List.assoc_opt src env) ~default:src in
+            let env' = (dst, src') :: List.remove_assoc dst env in
+            let aliases' =
+              if starts_with dst "local_"
+                 && List.mem src' fn.MicroIR.params
+                 && Option.value (CfgAnalysis.SM.find_opt dst def_counts) ~default:0 = 1
+              then
+                (dst, src') :: List.remove_assoc dst aliases
+              else
+                aliases
+            in
+            scan env' aliases' rest
+        | MicroIR.IAssign (dst, _) :: rest ->
+            let env' = List.remove_assoc dst env in
+            scan env' aliases rest
+        | MicroIR.ICall (Some dst, _, _) :: rest ->
+            let env' = List.remove_assoc dst env in
+            scan env' aliases rest
+        | _ :: rest -> scan env aliases rest
+      in
+      scan initial_env [] blk.MicroIR.body
+
+let rename_value ren = function
+  | MicroIR.VReg v -> MicroIR.VReg (Option.value (List.assoc_opt v ren) ~default:v)
+  | v -> v
+
+let rename_expr ren = function
+  | MicroIR.EVal v -> MicroIR.EVal (rename_value ren v)
+  | MicroIR.EBinop (op, a, b) -> MicroIR.EBinop (op, rename_value ren a, rename_value ren b)
+  | MicroIR.ELoad v -> MicroIR.ELoad (rename_value ren v)
+  | MicroIR.EAddr (v, off) -> MicroIR.EAddr (rename_value ren v, off)
+  | MicroIR.EIndex (base, idx, width) ->
+      MicroIR.EIndex (rename_value ren base, rename_value ren idx, width)
+  | MicroIR.EField (base, fld) -> MicroIR.EField (rename_value ren base, fld)
+  | MicroIR.ECmp (pred, a, b) -> MicroIR.ECmp (pred, rename_value ren a, rename_value ren b)
+
+let rename_instr ren src_aliases = function
+  | MicroIR.IAssign (dst, MicroIR.EVal (MicroIR.VReg src)) ->
+      let dst' = Option.value (List.assoc_opt dst ren) ~default:dst in
+      let src' = Option.value (List.assoc_opt src src_aliases) ~default:src in
+      if dst' = src' then
+        None
+      else
+        Some (MicroIR.IAssign (dst', MicroIR.EVal (MicroIR.VReg src')))
+  | MicroIR.IAssign (dst, e) ->
+      Some
+        (MicroIR.IAssign
+           (Option.value (List.assoc_opt dst ren) ~default:dst, rename_expr ren e))
+  | MicroIR.IStore (a, b) -> Some (MicroIR.IStore (rename_value ren a, rename_value ren b))
+  | MicroIR.IAssume e -> Some (MicroIR.IAssume (rename_expr ren e))
+  | MicroIR.IAssert e -> Some (MicroIR.IAssert (rename_expr ren e))
+  | MicroIR.ICall (ret, callee, args) ->
+      Some
+        (MicroIR.ICall
+           (Option.map (fun dst -> Option.value (List.assoc_opt dst ren) ~default:dst) ret,
+            rename_value ren callee,
+            List.map (rename_value ren) args))
+
+let rename_term ren = function
+  | MicroIR.TJump _ as t -> t
+  | MicroIR.TStop as t -> t
+  | MicroIR.TBranch (e, t, f) -> MicroIR.TBranch (rename_expr ren e, t, f)
+  | MicroIR.TSwitch (v, cases, dflt) -> MicroIR.TSwitch (rename_value ren v, cases, dflt)
+  | MicroIR.TReturn v -> MicroIR.TReturn (Option.map (rename_value ren) v)
+
+let normalize_arg_spills abi (fn : MicroIR.func) =
+  let ren = arg_spill_aliases abi fn in
+  if ren = [] then
+    fn
+  else
+    let src_aliases =
+      match abi with
+      | X86_32 -> ren
+      | X86_64 | ARM_32 ->
+          let param_regs = abi_param_regs abi in
+          let reg_aliases =
+            zip param_regs fn.MicroIR.params
+          in
+          ren @ reg_aliases
+    in
+    let blocks =
+      fn.MicroIR.blocks
+      |> List.map (fun blk ->
+             {
+               blk with
+               MicroIR.body =
+                 blk.MicroIR.body |> List.filter_map (rename_instr ren src_aliases);
+               term = rename_term ren blk.MicroIR.term;
+             })
+    in
+    {
+      fn with
+      MicroIR.ret =
+        Option.map (fun r -> Option.value (List.assoc_opt r ren) ~default:r) fn.MicroIR.ret;
+      blocks;
+    }
+
 let import ?(func = "main") path =
   let funcs = defined_functions path in
   if not (List.mem func funcs) then
@@ -806,4 +948,7 @@ let import ?(func = "main") path =
     let params_aliases = param_aliases abi instrs in
     let aliases = params_aliases @ local_aliases abi instrs in
     let params = param_names params_aliases in
-    [ build_blocks abi func params (abi_return_reg abi) params_aliases aliases instrs ]
+    [
+      build_blocks abi func params (abi_return_reg abi) params_aliases aliases instrs
+      |> normalize_arg_spills abi;
+    ]

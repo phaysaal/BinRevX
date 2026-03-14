@@ -218,6 +218,176 @@ where:
 
 - $Pre_f$ is the precondition
 - $Post_f$ is the postcondition
+- $Mod_f$ is the modified-variable and modified-memory set
+- $Ret_f$ is the return-value relation
+- $Calls_f$ is the set of callees
+
+## 7. Slacsec-Inspired Symbolic Heap Layer
+
+`slacsec` is the right reference for the next `BinRevX` step, not because of
+its frontend, but because of its middle-end analysis architecture:
+
+- symbolic state threaded by a `precond` function
+- symbolic heaps with points-to and inductive predicates
+- entailment checks between heap states
+- bi-abduction to infer the missing caller heap and frame
+- modular function summaries expressed as heap + pure constraints
+
+The core import from `slacsec` should be the analysis shape:
+
+`state -> command -> state-set + return-set`
+
+augmented with heap reasoning:
+
+`state = <sigma, delta, heap, frame, rho, pc>`
+
+where:
+
+- `sigma` is the symbolic store
+- `delta` is the path-condition set
+- `heap` is the known symbolic heap
+- `frame` is the caller-owned heap required to make execution valid
+- `rho` is an optional metadata environment for provenance/security/taint
+- `pc` is the current path context
+
+### 7.1 Suggested BinRevX State
+
+For `BinRevX`, the practical symbolic state should be:
+
+$State = (Sigma, Delta, Heap, Frame, Regions, Mods, Meta)$
+
+where:
+
+- $Sigma : Var -> Term$
+- $Delta$ is a conjunction or disjunction-normalized set of path constraints
+- $Heap$ is a symbolic heap
+- $Frame$ is the abducted missing heap
+- $Regions$ tracks recovered structural regions and current loop context
+- $Mods$ tracks modified registers, stack slots, globals, and heap objects
+- $Meta$ stores ABI, architecture, and provenance facts
+
+### 7.2 Symbolic Heap Vocabulary
+
+The heap language should be small and map directly from recovered memory
+patterns:
+
+- `Pto(base, fields)` for concrete cells / structs
+- `Arr(base, lo, hi, width)` for contiguous arrays
+- `Str(base, lo, hi)` for string segments
+- `Ls(x, y, next)` for linked-list segments
+
+This lines up well with the current `BinRevX` memory-pattern detector:
+
+- array loops should propose `Arr`
+- string loops should propose `Str`
+- linked-list loops should propose `Ls`
+
+### 7.3 Role of Entailment
+
+`slacsec`'s `entlcheckA` is the key model here.
+
+In `BinRevX`, heap entailment should answer:
+
+$Heap_1 |= Heap_2$
+
+meaning every concrete memory state satisfying $Heap_1$ also satisfies
+$Heap_2$.
+
+This is needed for:
+
+- loop invariant checking
+- pruning subsumed symbolic states
+- modular call checking against callee preconditions
+- validating candidate summaries
+
+### 7.4 Role of Bi-Abduction
+
+`slacsec`'s `biabd` family solves the modular-analysis problem:
+
+given caller heap $H_c$ and callee requirement $H_r$, find:
+
+- anti-frame $X$ such that $H_c * X$ satisfies the callee precondition
+- frame $Y$ such that the unused caller heap is preserved
+
+Mathematically:
+
+$H_c * X |= H_r * Y$
+
+For `BinRevX`, this should become the default call rule for unknown or
+partially known callees.
+
+### 7.5 How Structural Recovery Feeds Heap Analysis
+
+`BinRevX` has one major advantage over `slacsec`: it can recover loops and
+memory traversals directly from binaries before symbolic execution.
+
+That means structural recovery should synthesize heap candidates before the
+heap engine runs:
+
+- array cursor + stable base + bound -> `Arr`
+- byte cursor + zero-sentinel exit -> `Str`
+- pointer chase + null exit + next field -> `Ls`
+
+This gives a pipeline:
+
+`binary -> MicroIR -> regions -> memory patterns -> heap predicates -> symheap analysis`
+
+### 7.6 Function Summaries
+
+The next `BinRevX` function summary should move from:
+
+`params/pre/post/modifies/calls`
+
+to:
+
+$Summary(f) = (Pre_f, Post_f, Frame_f, Mod_f, Ret_f, Calls_f)$
+
+with:
+
+- $Pre_f$ containing pure constraints and heap predicates required at entry
+- $Post_f$ containing return/value and heap-shape relations after execution
+- $Frame_f$ containing preserved caller heap
+- $Mod_f$ containing modified abstract locations
+
+### 7.7 Loop Summaries
+
+The current recurrence summaries should be lifted into heap-aware loop
+summaries:
+
+$LoopSummary = (Inv, Guard, Step, Footprint, Variant)$
+
+where:
+
+- $Inv$ is a pure + heap invariant
+- $Guard$ is the loop-continuation condition
+- $Step$ is the recurrence / heap-update relation
+- $Footprint$ is the set of touched heap regions
+- $Variant$ is the progress measure
+
+### 7.8 Immediate Implementation Plan
+
+The next concrete steps for `BinRevX` should be:
+
+1. Introduce a `SymHeap` module with `Pto`, `Arr`, `Str`, and `Ls`.
+2. Extend symbolic states from `env + mem + path` to store/frame heaps.
+3. Convert existing memory-pattern outputs into candidate heap predicates.
+4. Add a small entailment engine for pure + heap subsumption.
+5. Add a first bi-abduction rule for function calls and loop widening.
+6. Replace ad hoc memory facts with heap predicates in summaries and VCs.
+
+## 8. Naming and Interface Preservation
+
+For imported binaries, locals that are provably immutable spills of parameters
+should be normalized back to the corresponding argument names. This matters for:
+
+- readable summaries
+- stable modular interfaces
+- correct matching between call arguments and callee preconditions
+- later heap predicates keyed by formal parameters rather than frame slots
+
+The current importer now performs this normalization when the evidence is
+strong enough, so recovered guards can refer to names like `arg1` instead of
+temporary stack-slot names such as `local_18`.
 - $Mod_f$ is the modified state set
 - $Ret_f$ is the return relation
 - $Calls_f$ is the call-summary dependency set
