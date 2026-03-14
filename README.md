@@ -34,6 +34,9 @@ This is now a working prototype. It currently provides:
 - a design document in [ARCHITECTURE.md](/home/faisal/code/hobby/llvmpattern/BinRevX/ARCHITECTURE.md)
 - a text-based `MicroIR` loader
 - a single-function ELF importer for symbolized binaries
+  - x86-32 with stack-parameter recovery
+  - x86-64 with register-parameter recovery
+  - ARM32 ABI support in code, subject to disassembler availability
 - CFG, dominator, and natural-loop recovery
 - region recovery for loops and branch headers
 - symbolic state seeding and block interpretation
@@ -122,7 +125,7 @@ Instead:
 ## ELF Import Scope
 
 The current ELF importer is intentionally narrow.
-It uses `nm` and `objdump` to import one function and lift a small subset of Intel-style x86 instructions into `MicroIR`.
+It uses `nm`, `readelf`, and `objdump` to import one function and lift a small subset of machine instructions into `MicroIR`.
 
 What it is good for:
 
@@ -138,6 +141,7 @@ Current limits:
 - partial instruction coverage
 - approximate memory semantics
 - memory-pattern classification on imported assembly is still weaker than on hand-authored `MicroIR`
+- ARM import also depends on the local toolchain providing an ARM-capable disassembler
 
 ## Memory Patterns
 
